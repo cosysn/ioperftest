@@ -50,6 +50,9 @@ struct io_request {
     uint32_t thread_id;             /* Target thread ID */
     struct dif_info dif;            /* DIF information */
     bool is_write;                  /* Write operation flag */
+
+    /* 128 fields for custom data */
+    uint64_t field[128];
 };
 
 /* Simple lock-free queue (SPSC) implementation */
@@ -423,6 +426,11 @@ int main(int argc, char *argv[])
             io->lba = total_io % 1000000;
             io->len = 64;
             io->is_write = (total_io % 2 == 0);
+
+            /* Initialize 128 fields */
+            for (int i = 0; i < 128; i++) {
+                io->field[i] = io->lba + i;
+            }
 
             /* Dispatch to worker thread based on LBA */
             uint32_t thread_id = lba_to_thread(io->lba, NUM_THREADS);

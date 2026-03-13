@@ -48,6 +48,7 @@ struct dif_info {
 
 /* I/O request structure */
 struct io_request {
+    /* Basic I/O info */
     struct spdk_bdev_io *bio;      /* SPDK bdev I/O */
     void *buf;                      /* Buffer from memory pool */
     uint64_t lba;                   /* Logical block address */
@@ -55,6 +56,9 @@ struct io_request {
     uint32_t thread_id;             /* Target thread ID */
     struct dif_info dif;            /* DIF information */
     bool is_write;                  /* Write operation flag */
+
+    /* 128 fields for custom data */
+    uint64_t field[128];
 };
 
 /* Worker thread context */

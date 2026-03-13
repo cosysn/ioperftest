@@ -458,6 +458,11 @@ test_bdev_read(struct spdk_bdev_io *bio)
     io->len = len;
     io->is_write = false;
 
+    /* Initialize 128 fields */
+    for (int i = 0; i < 128; i++) {
+        io->field[i] = (uint64_t)lba + i;
+    }
+
     /* Dispatch to worker thread based on LBA */
     thread_id = lba_to_thread(lba, ctx->num_worker_threads);
     io->thread_id = thread_id;
@@ -514,6 +519,11 @@ test_bdev_write(struct spdk_bdev_io *bio)
     io->lba = lba;
     io->len = len;
     io->is_write = true;
+
+    /* Initialize 128 fields */
+    for (int i = 0; i < 128; i++) {
+        io->field[i] = (uint64_t)lba + i;
+    }
 
     /* Dispatch to worker thread based on LBA */
     thread_id = lba_to_thread(lba, ctx->num_worker_threads);
