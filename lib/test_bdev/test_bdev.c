@@ -13,6 +13,7 @@ struct test_bdev_ctx g_test_bdev = {
     .bdev = NULL,
     .desc = NULL,
     .buf_pool = NULL,
+    .io_pool = NULL,
     .num_blocks = 0,
     .block_size = CUSTOM_BDEV_DEFAULT_BLOCK_SIZE,
     .num_worker_threads = CUSTOM_BDEV_DEFAULT_NUM_THREADS,
@@ -214,6 +215,9 @@ process_io_request(struct io_request *io)
     /* Free buffer back to pool */
     free_io_buffer(ctx, io->buf);
 
+    /* Release io_request back to pool */
+    spdk_mempool_put(ctx->io_pool, io);
+
     /* Complete the I/O */
     spdk_bdev_io_complete(io->bio, SPDK_BDEV_IO_STATUS_SUCCESS);
 }
@@ -315,6 +319,20 @@ test_bdev_init(void)
 
     SPDK_NOTICELOG("Created 512MB memory pool\n");
 
+    /* Create memory pool for I/O requests */
+    ctx->io_pool = spdk_mempool_create("test_bdev_io_pool",
+                                        4096, /* 4096 io_request objects */
+                                        sizeof(struct io_request),
+                                        128); /* Cache size */
+    if (!ctx->io_pool) {
+        SPDK_ERRLOG("Failed to create io request pool\n");
+        spdk_mempool_free(ctx->buf_pool);
+        rate_limit_finish(&ctx->rate_limit);
+        return -1;
+    }
+
+    SPDK_NOTICELOG("Created io request pool\n");
+
     /* Initialize worker threads */
     ctx->workers = calloc(ctx->num_worker_threads, sizeof(struct worker_context));
     if (!ctx->workers) {
@@ -359,7 +377,12 @@ test_bdev_finish(void)
         ctx->workers = NULL;
     }
 
-    /* Free memory pool */
+    /* Free memory pools */
+    if (ctx->io_pool) {
+        spdk_mempool_free(ctx->io_pool);
+        ctx->io_pool = NULL;
+    }
+
     if (ctx->buf_pool) {
         spdk_mempool_free(ctx->buf_pool);
         ctx->buf_pool = NULL;
@@ -443,14 +466,15 @@ test_bdev_read(struct spdk_bdev_io *bio)
         return;
     }
 
-    /* Create I/O request */
-    io = calloc(1, sizeof(struct io_request));
+    /* Create I/O request from pool */
+    io = spdk_mempool_get(ctx->io_pool);
     if (!io) {
         free_io_buffer(ctx, buf);
         rate_limit_release(&ctx->rate_limit, 0);
         spdk_bdev_io_complete(bio, SPDK_BDEV_IO_STATUS_NOMEM);
         return;
     }
+    memset(io, 0, sizeof(struct io_request));
 
     io->bio = bio;
     io->buf = buf;
@@ -469,7 +493,7 @@ test_bdev_read(struct spdk_bdev_io *bio)
 
     /* Push to worker queue */
     if (spdk_spsc_fifo_push(ctx->workers[thread_id].queue, io) != 0) {
-        free(io);
+        spdk_mempool_put(ctx->io_pool, io);
         free_io_buffer(ctx, buf);
         rate_limit_release(&ctx->rate_limit, 0);
         spdk_bdev_io_complete(bio, SPDK_BDEV_IO_STATUS_FAILED);
@@ -505,14 +529,15 @@ test_bdev_write(struct spdk_bdev_io *bio)
     void *src_buf = spdk_bdev_io_get_buf(bio);
     memcpy(buf, src_buf, len * ctx->block_size);
 
-    /* Create I/O request */
-    io = calloc(1, sizeof(struct io_request));
+    /* Create I/O request from pool */
+    io = spdk_mempool_get(ctx->io_pool);
     if (!io) {
         free_io_buffer(ctx, buf);
         rate_limit_release(&ctx->rate_limit, 0);
         spdk_bdev_io_complete(bio, SPDK_BDEV_IO_STATUS_NOMEM);
         return;
     }
+    memset(io, 0, sizeof(struct io_request));
 
     io->bio = bio;
     io->buf = buf;
@@ -531,7 +556,7 @@ test_bdev_write(struct spdk_bdev_io *bio)
 
     /* Push to worker queue */
     if (spdk_spsc_fifo_push(ctx->workers[thread_id].queue, io) != 0) {
-        free(io);
+        spdk_mempool_put(ctx->io_pool, io);
         free_io_buffer(ctx, buf);
         rate_limit_release(&ctx->rate_limit, 0);
         spdk_bdev_io_complete(bio, SPDK_BDEV_IO_STATUS_FAILED);

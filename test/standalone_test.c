@@ -63,6 +63,7 @@ struct simple_queue {
     uint64_t size;
 };
 
+/* Simple lock-free queue (SPSC) implementation */
 struct simple_queue *
 simple_queue_create(uint64_t size)
 {
@@ -285,10 +286,12 @@ worker_thread_func(void *arg)
             /* Release rate limit */
             rate_limit_release(ctx->rate_limit, io->len * 512);
 
-            /* Free buffer back to pool */
+            /* Free buffer */
             if (io->buf) {
                 free(io->buf);
             }
+
+            /* Release io_request back to pool */
             free(io);
         } else {
             /* Queue empty, yield */
@@ -378,6 +381,7 @@ int main(int argc, char *argv[])
     for (uint32_t i = 0; i < NUM_THREADS; i++) {
         if (worker_thread_init(&workers[i], i, &rate_limit, QUEUE_SIZE) != 0) {
             fprintf(stderr, "Failed to initialize worker thread %u\n", i);
+            rate_limit_finish(&rate_limit);
             return 1;
         }
     }
