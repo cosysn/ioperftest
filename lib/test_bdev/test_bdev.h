@@ -73,8 +73,8 @@ struct worker_context {
 struct test_bdev_ctx {
     struct spdk_bdev *bdev;
     struct spdk_bdev_desc *desc;
-    struct spdk_mempool *buf_pool;      /* Buffer memory pool */
-    struct spdk_mempool *io_pool;       /* I/O request memory pool */
+    struct spdk_mempool *buf_pool;       /* Buffer memory pool */
+    struct spdk_mempool *io_pool;        /* I/O request memory pool */
     struct rate_limit rate_limit;
     uint64_t num_blocks;
     uint32_t block_size;
