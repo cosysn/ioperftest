@@ -2,14 +2,14 @@
  * Copyright (c) 2024
  */
 
-#include "custom_bdev.h"
+#include "test_bdev.h"
 #include <spdk/log.h>
 #include <spdk/string.h>
 
-SPDK_LOG_REGISTER_COMPONENT("custom_bdev", SPDK_LOG_CUSTOM_BDEV)
+SPDK_LOG_REGISTER_COMPONENT("test_bdev", SPDK_LOG_CUSTOM_BDEV)
 
 /* Global module context */
-struct custom_bdev_ctx g_custom_bdev = {
+struct test_bdev_ctx g_test_bdev = {
     .bdev = NULL,
     .desc = NULL,
     .buf_pool = NULL,
@@ -178,15 +178,15 @@ worker_thread_finish(struct worker_context *ctx)
 static void
 process_io_request(struct io_request *io)
 {
-    struct custom_bdev_ctx *ctx = &g_custom_bdev;
+    struct test_bdev_ctx *ctx = &g_test_bdev;
 
     /* Custom preprocessing */
     if (io->is_write) {
-        custom_bdev_preprocess_write(io);
+        test_bdev_preprocess_write(io);
         /* Add DIF info for write */
         set_dif_info(io);
     } else {
-        custom_bdev_preprocess_read(io);
+        test_bdev_preprocess_read(io);
     }
 
     /* For this custom bdev, we simulate I/O by copying from/to memory
@@ -194,19 +194,19 @@ process_io_request(struct io_request *io)
      */
     if (io->is_write) {
         /* Write: data is already in buffer from memory pool */
-        SPDK_DEBUGLOG(custom_bdev, "WRITE: lba=%lu, len=%u, buf=%p\n",
+        SPDK_DEBUGLOG(test_bdev, "WRITE: lba=%lu, len=%u, buf=%p\n",
                       io->lba, io->len, io->buf);
     } else {
         /* Read: fill buffer with data (simulated) */
-        SPDK_DEBUGLOG(custom_bdev, "READ: lba=%lu, len=%u, buf=%p\n",
+        SPDK_DEBUGLOG(test_bdev, "READ: lba=%lu, len=%u, buf=%p\n",
                       io->lba, io->len, io->buf);
-        custom_bdev_postprocess_read(io);
+        test_bdev_postprocess_read(io);
 
         /* Verify DIF for read */
         verify_dif_info(io);
     }
 
-    custom_bdev_postprocess_write(io);
+    test_bdev_postprocess_write(io);
 
     /* Release rate limit */
     rate_limit_release(&ctx->rate_limit, io->len * ctx->block_size);
@@ -242,7 +242,7 @@ worker_thread_func(void *arg)
 
 /* Memory pool functions */
 void *
-alloc_io_buffer(struct custom_bdev_ctx *ctx)
+alloc_io_buffer(struct test_bdev_ctx *ctx)
 {
     void *buf;
     int ret;
@@ -257,7 +257,7 @@ alloc_io_buffer(struct custom_bdev_ctx *ctx)
 }
 
 void
-free_io_buffer(struct custom_bdev_ctx *ctx, void *buf)
+free_io_buffer(struct test_bdev_ctx *ctx, void *buf)
 {
     if (buf) {
         spdk_mempool_put(ctx->buf_pool, buf);
@@ -266,36 +266,36 @@ free_io_buffer(struct custom_bdev_ctx *ctx, void *buf)
 
 /* Custom I/O preprocessing/Postprocessing hooks */
 void
-custom_bdev_preprocess_read(struct io_request *io)
+test_bdev_preprocess_read(struct io_request *io)
 {
     /* Placeholder for custom read preprocessing */
     /* Example: decryption, decompression, cache lookup */
 }
 
 void
-custom_bdev_preprocess_write(struct io_request *io)
+test_bdev_preprocess_write(struct io_request *io)
 {
     /* Placeholder for custom write preprocessing */
     /* Example: encryption, compression, cache insertion */
 }
 
 void
-custom_bdev_postprocess_read(struct io_request *io)
+test_bdev_postprocess_read(struct io_request *io)
 {
     /* Placeholder for custom read postprocessing */
 }
 
 void
-custom_bdev_postprocess_write(struct io_request *io)
+test_bdev_postprocess_write(struct io_request *io)
 {
     /* Placeholder for custom write postprocessing */
 }
 
 /* SPDK Bdev module implementation */
 static int
-custom_bdev_init(void)
+test_bdev_init(void)
 {
-    struct custom_bdev_ctx *ctx = &g_custom_bdev;
+    struct test_bdev_ctx *ctx = &g_test_bdev;
 
     SPDK_NOTICELOG("Custom bdev module initializing\n");
 
@@ -303,7 +303,7 @@ custom_bdev_init(void)
     rate_limit_init(&ctx->rate_limit, 0, 0); /* No limits by default */
 
     /* Create memory pool for I/O buffers (500MB) */
-    ctx->buf_pool = spdk_mempool_create("custom_bdev_pool",
+    ctx->buf_pool = spdk_mempool_create("test_bdev_pool",
                                           1024, /* 1024 buffers */
                                           CUSTOM_BDEV_DEFAULT_BLOCK_SIZE * 64, /* 64 blocks per buffer */
                                           32); /* Cache size */
@@ -339,9 +339,9 @@ custom_bdev_init(void)
 }
 
 static void
-custom_bdev_finish(void)
+test_bdev_finish(void)
 {
-    struct custom_bdev_ctx *ctx = &g_custom_bdev;
+    struct test_bdev_ctx *ctx = &g_test_bdev;
 
     SPDK_NOTICELOG("Custom bdev module finishing\n");
 
@@ -375,11 +375,11 @@ custom_bdev_finish(void)
 
 /* Bdev function table */
 static int
-custom_bdev_create(struct spdk_bdev **bdev, struct spdk_bdev_desc *desc,
+test_bdev_create(struct spdk_bdev **bdev, struct spdk_bdev_desc *desc,
                    const char *bdev_name, uint64_t num_blocks,
                    uint32_t block_size)
 {
-    struct custom_bdev_ctx *ctx = &g_custom_bdev;
+    struct test_bdev_ctx *ctx = &g_test_bdev;
     struct spdk_bdev *b = NULL;
     int ret;
 
@@ -410,7 +410,7 @@ custom_bdev_create(struct spdk_bdev **bdev, struct spdk_bdev_desc *desc,
 }
 
 static int
-custom_bdev_delete(struct spdk_bdev *bdev)
+test_bdev_delete(struct spdk_bdev *bdev)
 {
     if (bdev) {
         spdk_bdev_destroy(bdev);
@@ -419,9 +419,9 @@ custom_bdev_delete(struct spdk_bdev *bdev)
 }
 
 static void
-custom_bdev_read(struct spdk_bdev_io *bio)
+test_bdev_read(struct spdk_bdev_io *bio)
 {
-    struct custom_bdev_ctx *ctx = &g_custom_bdev;
+    struct test_bdev_ctx *ctx = &g_test_bdev;
     struct io_request *io;
     void *buf;
     uint64_t lba = spdk_bdev_io_get_offset(bio);
@@ -473,9 +473,9 @@ custom_bdev_read(struct spdk_bdev_io *bio)
 }
 
 static void
-custom_bdev_write(struct spdk_bdev_io *bio)
+test_bdev_write(struct spdk_bdev_io *bio)
 {
-    struct custom_bdev_ctx *ctx = &g_custom_bdev;
+    struct test_bdev_ctx *ctx = &g_test_bdev;
     struct io_request *io;
     void *buf;
     uint64_t lba = spdk_bdev_io_get_offset(bio);
@@ -530,7 +530,7 @@ custom_bdev_write(struct spdk_bdev_io *bio)
 }
 
 /* Module definition */
-static struct spdk_bdev_fn_table custom_bdev_fn_table = {
+static struct spdk_bdev_fn_table test_bdev_fn_table = {
     .destructor = NULL,
     .submit_request = NULL, /* Will be set per bdev */
     .get_device_info = NULL,
@@ -543,4 +543,4 @@ static struct spdk_bdev_fn_table custom_bdev_fn_table = {
  */
 
 /* Register the module */
-SPDK_BDEV_MODULE_REGISTER(custom_bdev, NULL)
+SPDK_BDEV_MODULE_REGISTER(test_bdev, NULL)

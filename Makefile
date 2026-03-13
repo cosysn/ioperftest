@@ -4,14 +4,14 @@
 # Directories
 ROOT_DIR := $(shell pwd)
 SPDKBUILD ?= /opt/spdk
-LIB_DIR := $(ROOT_DIR)/lib/custom_bdev
+LIB_DIR := $(ROOT_DIR)/lib/test_bdev
 TEST_DIR := $(ROOT_DIR)/test
 INC_DIR := $(ROOT_DIR)/include
 
 # Build targets
-TARGET := custom_bdev_test
-STANDALONE_TARGET := custom_bdev_standalone
-OBJS := $(LIB_DIR)/custom_bdev.o
+TARGET := test_bdev_test
+STANDALONE_TARGET := test_bdev_standalone
+OBJS := $(LIB_DIR)/test_bdev.o
 TEST_SRC := $(TEST_DIR)/standalone_test.c
 
 # Compiler and flags
@@ -44,7 +44,7 @@ check_spdk:
 		echo "SPDK not found at $(SPDKBUILD). Building standalone version."; \
 	fi
 
-$(LIB_DIR)/custom_bdev.o: $(LIB_DIR)/custom_bdev.c $(LIB_DIR)/custom_bdev.h
+$(LIB_DIR)/test_bdev.o: $(LIB_DIR)/test_bdev.c $(LIB_DIR)/test_bdev.h
 	@mkdir -p $(ROOT_DIR)/build
 	$(CC) $(CFLAGS) $(SPDKBUILD_FLAGS) -c -o $@ $<
 
@@ -69,4 +69,4 @@ help:
 	@echo ""
 	@echo "Usage:"
 	@echo "  make"
-	@echo "  ./custom_bdev_standalone --max-iops=100000 --max-bw=500"
+	@echo "  ./test_bdev_standalone --max-iops=100000 --max-bw=500"

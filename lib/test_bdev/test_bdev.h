@@ -66,7 +66,7 @@ struct worker_context {
 };
 
 /* Custom bdev context */
-struct custom_bdev_ctx {
+struct test_bdev_ctx {
     struct spdk_bdev *bdev;
     struct spdk_bdev_desc *desc;
     struct spdk_mempool *buf_pool;      /* 500MB memory pool */
@@ -79,7 +79,7 @@ struct custom_bdev_ctx {
 };
 
 /* Global module context */
-extern struct custom_bdev_ctx g_custom_bdev;
+extern struct test_bdev_ctx g_test_bdev;
 
 /* Rate limit functions */
 int rate_limit_init(struct rate_limit *limit, uint64_t max_iops, uint64_t max_bw_mb);
@@ -99,13 +99,13 @@ void set_dif_info(struct io_request *io);
 void verify_dif_info(struct io_request *io);
 
 /* Memory pool functions */
-void *alloc_io_buffer(struct custom_bdev_ctx *ctx);
-void free_io_buffer(struct custom_bdev_ctx *ctx, void *buf);
+void *alloc_io_buffer(struct test_bdev_ctx *ctx);
+void free_io_buffer(struct test_bdev_ctx *ctx, void *buf);
 
 /* Custom I/O logic (can be customized) */
-void custom_bdev_preprocess_read(struct io_request *io);
-void custom_bdev_preprocess_write(struct io_request *io);
-void custom_bdev_postprocess_read(struct io_request *io);
-void custom_bdev_postprocess_write(struct io_request *io);
+void test_bdev_preprocess_read(struct io_request *io);
+void test_bdev_preprocess_write(struct io_request *io);
+void test_bdev_postprocess_read(struct io_request *io);
+void test_bdev_postprocess_write(struct io_request *io);
 
 #endif /* CUSTOM_BDEV_H */
