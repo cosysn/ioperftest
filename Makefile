@@ -5,12 +5,14 @@
 ROOT_DIR := $(shell pwd)
 SPDKBUILD ?= /opt/spdk
 LIB_DIR := $(ROOT_DIR)/lib/custom_bdev
+TEST_DIR := $(ROOT_DIR)/test
 INC_DIR := $(ROOT_DIR)/include
 
 # Build targets
 TARGET := custom_bdev_test
 STANDALONE_TARGET := custom_bdev_standalone
 OBJS := $(LIB_DIR)/custom_bdev.o
+TEST_SRC := $(TEST_DIR)/standalone_test.c
 
 # Compiler and flags
 CC ?= gcc
@@ -29,7 +31,7 @@ SPDK_AVAILABLE := $(shell if [ -f "$(SPDKBUILD)/build/lib/libspdk.so" ]; then ec
 
 all: standalone
 
-standalone: $(LIB_DIR)/standalone_test.c
+standalone: $(TEST_SRC)
 	@echo "Building standalone test version..."
 	$(CC) $(CFLAGS) -o $(ROOT_DIR)/$(STANDALONE_TARGET) $< $(LDFLAGS)
 	@echo "Build complete: $(ROOT_DIR)/$(STANDALONE_TARGET)"
