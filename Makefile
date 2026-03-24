@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
-# Makefile for Custom SPDK Bdev Module
+# Makefile for Custom Bdev Module (Standalone - No SPDK dependency)
 
 # Directories
 ROOT_DIR := $(shell pwd)
-SPDKBUILD ?= /opt/spdk
 LIB_DIR := $(ROOT_DIR)/lib/test_bdev
 TEST_DIR := $(ROOT_DIR)/test
 INC_DIR := $(ROOT_DIR)/include
@@ -17,17 +16,10 @@ TEST_SRC := $(TEST_DIR)/standalone_test.c
 # Compiler and flags
 CC ?= gcc
 CFLAGS := -Wall -Wextra -g -O2 -fPIC -pthread
-CFLAGS += -I$(INC_DIR)
+CFLAGS += -I$(INC_DIR) -I$(LIB_DIR)
 LDFLAGS := -lpthread
 
-# SPDK-specific flags
-SPDKBUILD ?= /opt/spdk
-SPDKBUILD_FLAGS := -I$(SPDKBUILD)/include -I$(SPDKBUILD)/build/include
-
-# Check if SPDK is built
-SPDK_AVAILABLE := $(shell if [ -f "$(SPDKBUILD)/build/lib/libspdk.so" ]; then echo "true"; else echo "false"; fi)
-
-.PHONY: all clean standalone check_spdk
+.PHONY: all clean standalone help
 
 all: standalone
 
@@ -36,17 +28,9 @@ standalone: $(TEST_SRC)
 	$(CC) $(CFLAGS) -o $(ROOT_DIR)/$(STANDALONE_TARGET) $< $(LDFLAGS)
 	@echo "Build complete: $(ROOT_DIR)/$(STANDALONE_TARGET)"
 
-check_spdk:
-	@echo "Checking for SPDK..."
-	@if [ -f "$(SPDKBUILD)/build/lib/libspdk.so" ]; then \
-		echo "SPDK found at $(SPDKBUILD)"; \
-	else \
-		echo "SPDK not found at $(SPDKBUILD). Building standalone version."; \
-	fi
-
 $(LIB_DIR)/test_bdev.o: $(LIB_DIR)/test_bdev.c $(LIB_DIR)/test_bdev.h
 	@mkdir -p $(ROOT_DIR)/build
-	$(CC) $(CFLAGS) $(SPDKBUILD_FLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
 	rm -f $(ROOT_DIR)/$(TARGET)
@@ -56,16 +40,13 @@ clean:
 
 # Help target
 help:
-	@echo "Custom SPDK Bdev Module Build System"
+	@echo "Custom Bdev Module Build System (Standalone - No SPDK)"
 	@echo ""
 	@echo "Targets:"
 	@echo "  standalone - Build standalone test version (no SPDK required)"
 	@echo "  all        - Alias for standalone"
 	@echo "  clean      - Remove build artifacts"
 	@echo "  help       - Show this help message"
-	@echo ""
-	@echo "Options:"
-	@echo "  SPDKBUILD=/path/to/spdk - Specify SPDK installation directory"
 	@echo ""
 	@echo "Usage:"
 	@echo "  make"

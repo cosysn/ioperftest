@@ -10,12 +10,10 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <sys/queue.h>
-
-#include <spdk/bdev.h>
-#include <spdk/bdev_module.h>
-#include <spdk/mempool.h>
-#include <spdk/spsc_fifo.h>
-#include <spdk/thread.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <errno.h>
 
 /* Configuration */
 #define CUSTOM_BDEV_DEFAULT_SIZE_MB     512
@@ -35,7 +33,7 @@ struct rate_limit {
 
 /* Pending I/O entry */
 struct pending_io {
-    struct spdk_bdev_io *bio;
+    void *data;
     TAILQ_ENTRY(pending_io) link;
 };
 
@@ -49,8 +47,7 @@ struct dif_info {
 /* I/O request structure */
 struct io_request {
     /* Basic I/O info */
-    struct spdk_bdev_io *bio;      /* SPDK bdev I/O */
-    void *buf;                      /* Buffer from memory pool */
+    void *buf;                      /* Buffer */
     uint64_t lba;                   /* Logical block address */
     uint32_t len;                   /* Length in blocks */
     uint32_t thread_id;             /* Target thread ID */
@@ -61,20 +58,32 @@ struct io_request {
     uint64_t field[128];
 };
 
+/* Simple lock-free queue (SPSC) structure */
+struct simple_queue {
+    volatile uint64_t write_idx;
+    volatile uint64_t read_idx;
+    struct io_request **entries;
+    uint64_t size;
+};
+
+/* Simple queue functions */
+struct simple_queue *simple_queue_create(uint64_t size);
+void simple_queue_free(struct simple_queue *q);
+int simple_queue_push(struct simple_queue *q, struct io_request *io);
+int simple_queue_pop(struct simple_queue *q, struct io_request **io);
+
 /* Worker thread context */
 struct worker_context {
     uint32_t thread_id;
-    struct spdk_thread *spdk_thread;
-    struct spdk_spsc_fifo *queue;
+    pthread_t thread;
+    struct simple_queue *queue;
     bool running;
 };
 
 /* Custom bdev context */
 struct test_bdev_ctx {
-    struct spdk_bdev *bdev;
-    struct spdk_bdev_desc *desc;
-    struct spdk_mempool *buf_pool;       /* Buffer memory pool */
-    struct spdk_mempool *io_pool;        /* I/O request memory pool */
+    void *buf_pool;                      /* Buffer memory pool */
+    void *io_pool;                       /* I/O request memory pool */
     struct rate_limit rate_limit;
     uint64_t num_blocks;
     uint32_t block_size;
