@@ -66,20 +66,27 @@ struct io_request {
     uint64_t field[128];
 };
 
-/* Simple lock-free queue (SPSC) implementation */
+/* Lock-free SPSC queue implementation using C11 atomics */
 struct simple_queue {
-    volatile uint64_t write_idx;
-    volatile uint64_t read_idx;
+    _Atomic uint64_t write_idx;
+    _Atomic uint64_t read_idx;
     struct io_request **entries;
     uint64_t size;
 };
 
-/* Simple lock-free queue (SPSC) implementation */
+/* Lock-free SPSC queue - create */
 struct simple_queue *
 simple_queue_create(uint64_t size)
 {
     struct simple_queue *q = calloc(1, sizeof(struct simple_queue));
     if (!q) return NULL;
+
+    /* Round up to power of 2 for fast modulo */
+    uint64_t pow2 = 1;
+    while (pow2 < size) {
+        pow2 <<= 1;
+    }
+    size = pow2;
 
     q->entries = calloc(size, sizeof(struct io_request *));
     if (!q->entries) {
@@ -88,8 +95,8 @@ simple_queue_create(uint64_t size)
     }
 
     q->size = size;
-    q->write_idx = 0;
-    q->read_idx = 0;
+    atomic_init(&q->write_idx, 0);
+    atomic_init(&q->read_idx, 0);
     return q;
 }
 
@@ -102,26 +109,36 @@ simple_queue_free(struct simple_queue *q)
     }
 }
 
+/* Lock-free SPSC push - only called by producer */
 int
 simple_queue_push(struct simple_queue *q, struct io_request *io)
 {
-    uint64_t next_write = (q->write_idx + 1) % q->size;
-    if (next_write == q->read_idx) {
+    uint64_t write = atomic_load_explicit(&q->write_idx, memory_order_relaxed);
+    uint64_t read = atomic_load_explicit(&q->read_idx, memory_order_acquire);
+
+    uint64_t next_write = (write + 1) & (q->size - 1);  /* Power of 2 modulo */
+    if (next_write == read) {
         return -1; /* Queue full */
     }
-    q->entries[q->write_idx] = io;
-    q->write_idx = next_write;
+
+    q->entries[write] = io;
+    atomic_store_explicit(&q->write_idx, next_write, memory_order_release);
     return 0;
 }
 
+/* Lock-free SPSC pop - only called by consumer */
 int
 simple_queue_pop(struct simple_queue *q, struct io_request **io)
 {
-    if (q->read_idx == q->write_idx) {
+    uint64_t read = atomic_load_explicit(&q->read_idx, memory_order_relaxed);
+    uint64_t write = atomic_load_explicit(&q->write_idx, memory_order_acquire);
+
+    if (read == write) {
         return -1; /* Queue empty */
     }
-    *io = q->entries[q->read_idx];
-    q->read_idx = (q->read_idx + 1) % q->size;
+
+    *io = q->entries[read];
+    atomic_store_explicit(&q->read_idx, (read + 1) & (q->size - 1), memory_order_release);
     return 0;
 }
 
