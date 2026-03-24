@@ -19,6 +19,16 @@
 
 /* Simplified structures without SPDK dependencies */
 
+/* Statistics structure */
+struct stats {
+    _Atomic uint64_t total_io;         /* Total I/O completed */
+    _Atomic uint64_t total_bytes;      /* Total bytes transferred */
+    _Atomic uint64_t total_reads;      /* Total read operations */
+    _Atomic uint64_t total_writes;     /* Total write operations */
+    _Atomic uint64_t prev_total_io;    /* For calculating IOPS */
+    _Atomic uint64_t prev_total_bytes; /* For calculating bandwidth */
+};
+
 /* Rate limit structure */
 struct rate_limit {
     uint64_t max_iops;          /* Max IOPS (0 = unlimited) */
@@ -27,6 +37,7 @@ struct rate_limit {
     _Atomic uint64_t cur_bytes; /* Current bandwidth counter */
     pthread_mutex_t queue_lock; /* Queue lock */
     TAILQ_HEAD(, pending_io) pending_queue; /* Pending I/O queue */
+    struct stats stats;         /* Statistics */
 };
 
 /* Pending I/O entry */
@@ -174,6 +185,43 @@ verify_dif_info(struct io_request *io)
     }
 }
 
+/* Statistics functions */
+static void
+stats_init(struct stats *s)
+{
+    atomic_init(&s->total_io, 0);
+    atomic_init(&s->total_bytes, 0);
+    atomic_init(&s->total_reads, 0);
+    atomic_init(&s->total_writes, 0);
+    atomic_init(&s->prev_total_io, 0);
+    atomic_init(&s->prev_total_bytes, 0);
+}
+
+static void
+stats_record(struct stats *s, uint32_t bytes, bool is_write)
+{
+    atomic_fetch_add(&s->total_io, 1);
+    atomic_fetch_add(&s->total_bytes, bytes);
+    if (is_write) {
+        atomic_fetch_add(&s->total_writes, 1);
+    } else {
+        atomic_fetch_add(&s->total_reads, 1);
+    }
+}
+
+static void
+stats_get(struct stats *s, uint64_t *iops, uint64_t *bw_mb)
+{
+    uint64_t curr_total_io = atomic_load(&s->total_io);
+    uint64_t curr_total_bytes = atomic_load(&s->total_bytes);
+
+    uint64_t prev_total_io = atomic_exchange(&s->prev_total_io, curr_total_io);
+    uint64_t prev_total_bytes = atomic_exchange(&s->prev_total_bytes, curr_total_bytes);
+
+    *iops = curr_total_io - prev_total_io;
+    *bw_mb = (curr_total_bytes - prev_total_bytes) / (1024 * 1024);
+}
+
 /* Rate limit implementation */
 int
 rate_limit_init(struct rate_limit *limit, uint64_t max_iops, uint64_t max_bw_mb)
@@ -184,6 +232,7 @@ rate_limit_init(struct rate_limit *limit, uint64_t max_iops, uint64_t max_bw_mb)
     atomic_init(&limit->cur_bytes, 0);
     pthread_mutex_init(&limit->queue_lock, NULL);
     TAILQ_INIT(&limit->pending_queue);
+    stats_init(&limit->stats);
 
     printf("Rate limit initialized: max_iops=%lu, max_bw_mb=%lu MB/s\n",
            max_iops, max_bw_mb);
@@ -282,6 +331,9 @@ worker_thread_func(void *arg)
                  */
                 /* verify_dif_info(io); */
             }
+
+            /* Record statistics */
+            stats_record(&ctx->rate_limit->stats, io->len * 512, io->is_write);
 
             /* Release rate limit */
             rate_limit_release(ctx->rate_limit, io->len * 512);
@@ -454,9 +506,12 @@ int main(int argc, char *argv[])
         uint64_t elapsed = (current_time.tv_sec - start_time.tv_sec);
         if (elapsed > last_report) {
             last_report = elapsed;
-            uint64_t cur_iops = atomic_load(&rate_limit.cur_iops);
-            printf("\rElapsed: %lus, Total I/O: %lu, Current IOPS: %lu",
-                   elapsed, total_io, cur_iops);
+            uint64_t iops, bw_mb;
+            stats_get(&rate_limit.stats, &iops, &bw_mb);
+            uint64_t total_io = atomic_load(&rate_limit.stats.total_io);
+            uint64_t total_bytes = atomic_load(&rate_limit.stats.total_bytes);
+            printf("\rElapsed: %2lus, IOPS: %6lu, BW: %4lu MB/s, Total: %lu I/O, %lu MB",
+                   elapsed, iops, bw_mb, total_io, total_bytes / (1024 * 1024));
             fflush(stdout);
         }
 
@@ -475,7 +530,17 @@ int main(int argc, char *argv[])
 
     rate_limit_finish(&rate_limit);
 
-    printf("Test complete! Total I/O: %lu\n", total_io);
+    uint64_t final_total_io = atomic_load(&rate_limit.stats.total_io);
+    uint64_t final_total_bytes = atomic_load(&rate_limit.stats.total_bytes);
+    uint64_t final_total_reads = atomic_load(&rate_limit.stats.total_reads);
+    uint64_t final_total_writes = atomic_load(&rate_limit.stats.total_writes);
+
+    printf("\n=== Test Results ===\n");
+    printf("Total I/O:   %lu\n", final_total_io);
+    printf("Total Read:  %lu\n", final_total_reads);
+    printf("Total Write: %lu\n", final_total_writes);
+    printf("Total Data:  %lu MB (%lu bytes)\n",
+           final_total_bytes / (1024 * 1024), final_total_bytes);
 
     return 0;
 }
