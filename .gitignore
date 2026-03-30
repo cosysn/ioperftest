@@ -1,0 +1,4 @@
+# Build outputs
+test_bdev_standalone
+*.o
+*.a
