@@ -7,9 +7,16 @@
 
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdatomic.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Handle atomics for both C and C++ */
+#ifndef __cplusplus
+#include <stdatomic.h>
+#else
+#include <atomic>
+#endif
 
 /* Power-of-2 rounding macro */
 #define RTE_DIMENSION(x) ( \
@@ -33,6 +40,16 @@ _rte_ring_round_pow2(uint32_t x)
 }
 
 /* rte_ring structure */
+#ifdef __cplusplus
+struct rte_ring {
+    char name[32];
+    uint32_t capacity;
+    uint32_t mask;
+    std::atomic<uint32_t> prod_tail;
+    std::atomic<uint32_t> cons_tail;
+    void **entries;
+};
+#else
 struct rte_ring {
     char name[32];
     uint32_t capacity;
@@ -41,6 +58,7 @@ struct rte_ring {
     _Atomic uint32_t cons_tail;
     void **entries;
 };
+#endif
 
 /* API functions */
 struct rte_ring *rte_ring_create(const char *name, uint32_t count);
@@ -52,5 +70,6 @@ uint32_t rte_ring_free_count(struct rte_ring *r);
 bool rte_ring_full(struct rte_ring *r);
 bool rte_ring_empty(struct rte_ring *r);
 const char *rte_ring_get_name(struct rte_ring *r);
+uint32_t rte_ring_capacity(struct rte_ring *r);
 
 #endif /* RTE_RING_H */

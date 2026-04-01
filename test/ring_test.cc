@@ -72,8 +72,8 @@ TEST_F(RingTest, EnqueueBeyondCapacity) {
     EXPECT_EQ(rte_ring_enqueue(ring, &value), -1);
 }
 
-TEST(RingTest, NullName) {
+TEST(RingTestNoFixture, NullNameRejected) {
+    // NULL name should be rejected for safety
     struct rte_ring *r = rte_ring_create(nullptr, 4);
-    EXPECT_NE(r, nullptr);
-    rte_ring_free(r);
+    EXPECT_EQ(r, nullptr);
 }

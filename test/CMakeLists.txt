@@ -1,7 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
-project(ring_test CXX)
+project(ioperftest C CXX)
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(Threads REQUIRED)
@@ -18,8 +20,14 @@ FetchContent_MakeAvailable(googletest)
 enable_testing()
 
 include_directories(
-    ${CMAKE_SOURCE_DIR}/lib/test_bdev
-    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/../lib/test_bdev
+    ${CMAKE_SOURCE_DIR}/../include
+    ${CMAKE_SOURCE_DIR}
+)
+
+# Compile C library
+add_library(ring STATIC
+    ${CMAKE_SOURCE_DIR}/../lib/test_bdev/rte_ring.c
 )
 
 add_executable(ring_test
@@ -27,6 +35,7 @@ add_executable(ring_test
 )
 
 target_link_libraries(ring_test
+    ring
     gtest_main
     gtest
     Threads::Threads
