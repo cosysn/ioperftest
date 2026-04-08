@@ -21,6 +21,7 @@ enable_testing()
 
 include_directories(
     ${CMAKE_SOURCE_DIR}/../lib/test_bdev
+    ${CMAKE_SOURCE_DIR}/../lib/ioperf
     ${CMAKE_SOURCE_DIR}/../include
     ${CMAKE_SOURCE_DIR}
 )
@@ -30,8 +31,17 @@ add_library(ring STATIC
     ${CMAKE_SOURCE_DIR}/../lib/test_bdev/rte_ring.c
 )
 
+# Compile ioperf library
+add_library(ioperf STATIC
+    ${CMAKE_SOURCE_DIR}/../lib/ioperf/ioperf.c
+)
+
 add_executable(ring_test
     ring_test.cc
+)
+
+add_executable(ioperf_test
+    ioperf_test.cc
 )
 
 target_link_libraries(ring_test
@@ -41,5 +51,13 @@ target_link_libraries(ring_test
     Threads::Threads
 )
 
+target_link_libraries(ioperf_test
+    ioperf
+    gtest_main
+    gtest
+    Threads::Threads
+)
+
 include(GoogleTest)
 gtest_discover_tests(ring_test)
+gtest_discover_tests(ioperf_test)
