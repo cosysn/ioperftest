@@ -517,8 +517,6 @@ ioperf_disk_create(struct ioperf_disk **out_disk, const struct ioperf_opts *opts
     if (opts->poller_cpus_count > 0 && opts->poller_cpus != NULL) {
         disk->poller_cpus = calloc(opts->poller_cpus_count, sizeof(uint32_t));
         if (disk->poller_cpus == NULL) {
-            ioperf_hash_map_destroy(&disk->hash_map_1);
-            ioperf_hash_map_destroy(&disk->hash_map_2);
             free(disk);
             return -ENOMEM;
         }
