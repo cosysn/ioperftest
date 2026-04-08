@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <stdatomic.h>
+#include <sched.h>
 
 #include "ioperf.h"
 
@@ -106,6 +107,12 @@ io_complete(void *arg)
         pthread_cond_signal(&g_tracker.cond);
         pthread_mutex_unlock(&g_tracker.mutex);
     }
+    if (prev == 1) {
+        /* Last IO completed - wake up all waiting workers */
+        pthread_mutex_lock(&g_tracker.mutex);
+        pthread_cond_broadcast(&g_tracker.cond);
+        pthread_mutex_unlock(&g_tracker.mutex);
+    }
 }
 
 /* Sequential write test - async */
@@ -150,12 +157,18 @@ seq_write_worker(void *arg)
                 offset = 0;
             }
         }
+        /* Yield if we hit backpressure - let poller run */
+        if (atomic_load(&g_tracker.in_flight) >= g_tracker.max_in_flight) {
+            sched_yield();
+        }
     }
 
     /* Wait for remaining IO */
+    pthread_mutex_lock(&g_tracker.mutex);
     while (atomic_load(&g_tracker.in_flight) > 0) {
-        /* spin wait */
+        pthread_cond_wait(&g_tracker.cond, &g_tracker.mutex);
     }
+    pthread_mutex_unlock(&g_tracker.mutex);
 
     free(ios);
     return NULL;
@@ -201,11 +214,18 @@ seq_read_worker(void *arg)
                 offset = 0;
             }
         }
+        /* Yield if we hit backpressure - let poller run */
+        if (atomic_load(&g_tracker.in_flight) >= g_tracker.max_in_flight) {
+            sched_yield();
+        }
     }
 
+    /* Wait for remaining IO */
+    pthread_mutex_lock(&g_tracker.mutex);
     while (atomic_load(&g_tracker.in_flight) > 0) {
-        /* spin wait */
+        pthread_cond_wait(&g_tracker.cond, &g_tracker.mutex);
     }
+    pthread_mutex_unlock(&g_tracker.mutex);
 
     free(ios);
     return NULL;
@@ -245,11 +265,18 @@ rand_io_worker(void *arg)
                 idx++;
             }
         }
+        /* Yield if we hit backpressure - let poller run */
+        if (atomic_load(&g_tracker.in_flight) >= g_tracker.max_in_flight) {
+            sched_yield();
+        }
     }
 
+    /* Wait for remaining IO */
+    pthread_mutex_lock(&g_tracker.mutex);
     while (atomic_load(&g_tracker.in_flight) > 0) {
-        /* spin wait */
+        pthread_cond_wait(&g_tracker.cond, &g_tracker.mutex);
     }
+    pthread_mutex_unlock(&g_tracker.mutex);
 
     free(ios);
     return NULL;
@@ -419,6 +446,8 @@ main(int argc, char *argv[])
     /* Init tracker */
     atomic_init(&g_tracker.in_flight, 0);
     g_tracker.max_in_flight = opts.num_threads * opts.io_depth;
+    pthread_mutex_init(&g_tracker.mutex, NULL);
+    pthread_cond_init(&g_tracker.cond, NULL);
 
     /* Allocate stats */
     g_stats = calloc(opts.num_threads, sizeof(struct thread_stats));
