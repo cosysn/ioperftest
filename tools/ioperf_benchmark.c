@@ -360,7 +360,7 @@ main(int argc, char *argv[])
             opts.is_rand_test = true;
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
             /* Parse CPU list, e.g. "0,2,4,6" */
-            char *cpulist = argv[++i];
+            char *cpulist = strdup(argv[++i]);
             char *token = strtok(cpulist, ",");
             uint32_t cpus[32];  /* max 32 CPUs */
             uint32_t count = 0;
@@ -368,6 +368,7 @@ main(int argc, char *argv[])
                 cpus[count++] = atoi(token);
                 token = strtok(NULL, ",");
             }
+            free(cpulist);
             if (count > 0) {
                 opts.poller_cpus = calloc(count, sizeof(uint32_t));
                 memcpy(opts.poller_cpus, cpus, count * sizeof(uint32_t));
