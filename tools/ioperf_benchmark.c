@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * Copyright (c) 2024
  * IOperf async benchmark tool
- * Fully async architecture: worker -> ring buffer -> poller -> completion -> worker
+ * Architecture:
+ *   Worker -> ring buffer -> Poller -> delay链表(每个poller一个) -> 完成
  */
 
 #include <stdio.h>
@@ -14,7 +15,6 @@
 #include <unistd.h>
 #include <stdatomic.h>
 #include <sched.h>
-#include <errno.h>
 
 /* Default configuration */
 #define DEFAULT_DISK_SIZE_MB   64
@@ -57,16 +57,25 @@ struct io_request {
     uint32_t num_blocks;
     uint32_t io_size;
     struct thread_stats *stats;
+    struct io_request *next;
 };
 
-/* Ring buffer for SPSC */
+/* Ring buffer for SPSC (worker -> poller) */
 struct ring_buffer {
-    struct io_request *requests;
+    struct io_request **requests;
     uint32_t size;
-    _Atomic uint32_t head;  /* producer writes here */
-    _Atomic uint32_t tail;  /* consumer reads here */
+    _Atomic uint32_t head;
+    _Atomic uint32_t tail;
     pthread_mutex_t mutex;
     pthread_cond_t cond;
+};
+
+/* Delay list (per poller) - 按时间排序的链表 */
+struct delay_list {
+    struct io_request *head;
+    struct io_request *tail;
+    uint32_t count;
+    pthread_mutex_t mutex;
 };
 
 /* Global state */
@@ -78,7 +87,7 @@ static struct thread_stats *g_stats;
 static uint32_t g_num_threads;
 static uint64_t g_start_ns;
 static struct ring_buffer *g_req_queues;
-static struct ring_buffer *g_comp_queues;
+static struct delay_list *g_delay_lists;
 
 /* Get current time in nanoseconds */
 static inline uint64_t
@@ -93,7 +102,7 @@ get_time_ns(void)
 static void
 ring_init(struct ring_buffer *rb, uint32_t size)
 {
-    rb->requests = calloc(size, sizeof(struct io_request));
+    rb->requests = calloc(size, sizeof(struct io_request *));
     rb->size = size;
     atomic_init(&rb->head, 0);
     atomic_init(&rb->tail, 0);
@@ -126,25 +135,20 @@ ring_full(struct ring_buffer *rb)
     return next_head == atomic_load(&rb->tail);
 }
 
-/* Enqueue (非阻塞) - 返回 true 成功, false 队列满 */
+/* Enqueue (非阻塞) */
 static bool
 ring_enqueue(struct ring_buffer *rb, struct io_request *req)
 {
     uint32_t head = atomic_load(&rb->head);
     uint32_t next_head = (head + 1) % rb->size;
 
-    /* 检查队列满 */
     if (next_head == atomic_load(&rb->tail)) {
         return false;
     }
 
-    /* 复制请求到队列 */
-    memcpy(&rb->requests[head], req, sizeof(struct io_request));
-
-    /* 发布头位置 */
+    rb->requests[head] = req;
     atomic_store(&rb->head, next_head);
 
-    /* 信号消费者 */
     pthread_mutex_lock(&rb->mutex);
     pthread_cond_signal(&rb->cond);
     pthread_mutex_unlock(&rb->mutex);
@@ -152,155 +156,238 @@ ring_enqueue(struct ring_buffer *rb, struct io_request *req)
     return true;
 }
 
-/* Dequeue (阻塞直到有数据) - 返回 true 成功 */
-static bool
-ring_dequeue(struct ring_buffer *rb, struct io_request *req)
+/* Dequeue (非阻塞) */
+static struct io_request *
+ring_dequeue(struct ring_buffer *rb)
 {
-    pthread_mutex_lock(&rb->mutex);
-
-    while (ring_empty(rb) && g_running) {
-        pthread_cond_wait(&rb->cond, &rb->mutex);
-    }
-
     if (ring_empty(rb)) {
-        pthread_mutex_unlock(&rb->mutex);
-        return false;
+        return NULL;
     }
 
     uint32_t tail = atomic_load(&rb->tail);
-    memcpy(req, &rb->requests[tail], sizeof(struct io_request));
+    struct io_request *req = rb->requests[tail];
     atomic_store(&rb->tail, (tail + 1) % rb->size);
 
-    pthread_mutex_unlock(&rb->mutex);
-
-    return true;
+    return req;
 }
 
-/* 非阻塞 Dequeue - 返回 true 成功, false 队列空 */
-static bool
-ring_dequeue_nb(struct ring_buffer *rb, struct io_request *req)
+/* Delay list init */
+static void
+delay_list_init(struct delay_list *dl)
 {
-    if (ring_empty(rb)) {
+    dl->head = NULL;
+    dl->tail = NULL;
+    dl->count = 0;
+    pthread_mutex_init(&dl->mutex, NULL);
+}
+
+/* Delay list destroy */
+static void
+delay_list_destroy(struct delay_list *dl)
+{
+    struct io_request *req = dl->head;
+    while (req) {
+        struct io_request *next = req->next;
+        free(req);
+        req = next;
+    }
+    pthread_mutex_destroy(&dl->mutex);
+}
+
+/* Add to delay list (按 submit_ns 排序插入) */
+static void
+delay_list_add(struct delay_list *dl, struct io_request *req)
+{
+    req->next = NULL;
+
+    pthread_mutex_lock(&dl->mutex);
+
+    if (dl->head == NULL) {
+        dl->head = req;
+        dl->tail = req;
+    } else if (req->submit_ns < dl->head->submit_ns) {
+        /* 插入到头部 */
+        req->next = dl->head;
+        dl->head = req;
+    } else {
+        /* 找到合适位置插入 */
+        struct io_request *curr = dl->head;
+        while (curr->next && curr->next->submit_ns < req->submit_ns) {
+            curr = curr->next;
+        }
+        req->next = curr->next;
+        curr->next = req;
+        if (req->next == NULL) {
+            dl->tail = req;
+        }
+    }
+    dl->count++;
+
+    pthread_mutex_unlock(&dl->mutex);
+}
+
+/* Pop from head if delay exceeded */
+static struct io_request *
+delay_list_pop_ready(struct delay_list *dl, uint64_t now, uint64_t delay_ns)
+{
+    pthread_mutex_lock(&dl->mutex);
+
+    if (dl->head == NULL) {
+        pthread_mutex_unlock(&dl->mutex);
+        return NULL;
+    }
+
+    if (now - dl->head->submit_ns >= delay_ns) {
+        struct io_request *req = dl->head;
+        dl->head = req->next;
+        if (dl->head == NULL) {
+            dl->tail = NULL;
+        }
+        dl->count--;
+        pthread_mutex_unlock(&dl->mutex);
+        return req;
+    }
+
+    pthread_mutex_unlock(&dl->mutex);
+    return NULL;
+}
+
+/* Check if head is ready (不删除) */
+static bool
+delay_list_head_ready(struct delay_list *dl, uint64_t now, uint64_t delay_ns)
+{
+    pthread_mutex_lock(&dl->mutex);
+
+    if (dl->head == NULL) {
+        pthread_mutex_unlock(&dl->mutex);
         return false;
     }
 
-    uint32_t tail = atomic_load(&rb->tail);
-    memcpy(req, &rb->requests[tail], sizeof(struct io_request));
-    atomic_store(&rb->tail, (tail + 1) % rb->size);
-
-    return true;
+    bool ready = (now - dl->head->submit_ns >= delay_ns);
+    pthread_mutex_unlock(&dl->mutex);
+    return ready;
 }
 
-/* Poller thread - busy polls request queue, processes after delay */
+/* Get count */
+static uint32_t
+delay_list_count(struct delay_list *dl)
+{
+    pthread_mutex_lock(&dl->mutex);
+    uint32_t count = dl->count;
+    pthread_mutex_unlock(&dl->mutex);
+    return count;
+}
+
+/* Poller thread */
 static void *
 poller_thread(void *arg)
 {
     uint32_t poller_id = *(uint32_t *)arg;
     struct ring_buffer *req_queue = &g_req_queues[poller_id];
-    struct ring_buffer *comp_queue = &g_comp_queues[poller_id];
-    struct io_request req;
+    struct delay_list *delay_list = &g_delay_lists[poller_id];
 
-    while (g_running) {
-        /* Try to dequeue a request (non-blocking) */
-        if (!ring_dequeue_nb(req_queue, &req)) {
-            /* 队列空，让出 CPU 避免 busy-wait */
-            sched_yield();
-            continue;
+    uint64_t read_delay_ns = (uint64_t)100 * 1000;  /* 100us */
+
+    while (g_running || delay_list_count(delay_list) > 0) {
+        /* 1. 从 ring buffer 取 IO，加入 delay list */
+        struct io_request *req = ring_dequeue(req_queue);
+        if (req != NULL) {
+            delay_list_add(delay_list, req);
         }
 
-        /* Check if delay has elapsed */
+        /* 2. 检查 delay list 头部是否 ready */
         uint64_t now = get_time_ns();
-        uint64_t delay_ns = (uint64_t)100 * 1000;  /* 100us read latency */
 
-        if (now - req.submit_ns < delay_ns) {
-            /* Delay not met, put back in queue */
-            if (!ring_enqueue(req_queue, &req)) {
-                /* 队列满，busy wait 一下再试 */
-                while (ring_full(req_queue) && g_running) {
-                    sched_yield();
-                }
-                if (g_running) {
-                    ring_enqueue(req_queue, &req);
-                }
+        /* 批量处理 ready 的 IO */
+        while (1) {
+            struct io_request *ready_req = delay_list_pop_ready(delay_list, now, read_delay_ns);
+            if (ready_req == NULL) {
+                break;
             }
-            continue;
+
+            /* 处理 IO */
+            ready_req->complete_ns = get_time_ns();
+
+            /* 模拟 IO 处理（内存访问模式） */
+            volatile uint64_t sum = 0;
+            for (uint32_t i = 0; i < 128; i++) {
+                sum += ready_req->offset_blocks + i;
+            }
+            (void)sum;
+
+            /* 统计（仅在非 drain 阶段） */
+            if (!g_draining) {
+                uint64_t latency = ready_req->complete_ns - ready_req->submit_ns;
+                ready_req->stats->io_completed++;
+                ready_req->stats->bytes_completed += ready_req->io_size;
+                ready_req->stats->total_latency_ns += latency;
+                if (ready_req->stats->min_latency_ns == 0 || latency < ready_req->stats->min_latency_ns) {
+                    ready_req->stats->min_latency_ns = latency;
+                }
+                if (latency > ready_req->stats->max_latency_ns) {
+                    ready_req->stats->max_latency_ns = latency;
+                }
+            } else {
+                /* drain 阶段只计数不统计延迟 */
+                ready_req->stats->io_completed++;
+                ready_req->stats->bytes_completed += ready_req->io_size;
+            }
+
+            free(ready_req);
         }
 
-        /* Delay met, process the IO (模拟处理) */
-        /* 模拟一些计算工作 */
-        volatile uint64_t sum = 0;
-        for (uint32_t i = 0; i < 128; i++) {
-            sum += req.offset_blocks + i;
-        }
-        (void)sum;
-
-        /* Enqueue completion */
-        req.complete_ns = get_time_ns();
-        while (!ring_enqueue(comp_queue, &req) && g_running) {
+        /* 3. 如果队列空且没有 ready 的 IO，让出 CPU */
+        if (ring_empty(req_queue) && !delay_list_head_ready(delay_list, get_time_ns(), read_delay_ns)) {
             sched_yield();
         }
+    }
+
+    /* Drain remaining in delay list */
+    uint64_t now = get_time_ns();
+    while (1) {
+        struct io_request *req = delay_list_pop_ready(delay_list, now, 0);
+        if (req == NULL) {
+            break;
+        }
+        req->stats->io_completed++;
+        req->stats->bytes_completed += req->io_size;
+        free(req);
     }
 
     return NULL;
 }
 
-/* Worker thread - generates IO requests asynchronously */
+/* Worker thread */
 static void *
 worker_thread(void *arg)
 {
     uint32_t worker_id = *(uint32_t *)arg;
-    struct thread_stats *stats = &g_stats[worker_id];
     struct ring_buffer *req_queue = &g_req_queues[worker_id];
-    struct ring_buffer *comp_queue = &g_comp_queues[worker_id];
-    struct io_request req;
+    struct io_request *req;
     uint64_t offset = 0;
 
     while (g_running) {
-        /* Try to get completions (non-blocking) to update stats */
-        while (ring_dequeue_nb(comp_queue, &req)) {
-            uint64_t latency = req.complete_ns - req.submit_ns;
+        /* 分配新请求 */
+        req = calloc(1, sizeof(*req));
+        req->submit_ns = get_time_ns();
+        req->offset_blocks = offset;
+        req->num_blocks = 1;
+        req->io_size = 512;
+        req->stats = &g_stats[worker_id];
 
-            stats->io_completed++;
-            stats->bytes_completed += req.io_size;
-            stats->total_latency_ns += latency;
-            if (stats->min_latency_ns == 0 || latency < stats->min_latency_ns) {
-                stats->min_latency_ns = latency;
-            }
-            if (latency > stats->max_latency_ns) {
-                stats->max_latency_ns = latency;
-            }
+        /* 入队 */
+        if (!ring_enqueue(req_queue, req)) {
+            /* 队列满，free 并让出 CPU */
+            free(req);
+            sched_yield();
+            continue;
         }
 
-        /* Submit new IO request */
-        req.submit_ns = get_time_ns();
-        req.offset_blocks = offset;
-        req.num_blocks = 1;
-        req.io_size = 512;
-        req.stats = stats;
-
-        /* Enqueue to poller */
-        if (!ring_enqueue(req_queue, &req)) {
-            /* 队列满，busy wait 一下 */
-            while (ring_full(req_queue) && g_running) {
-                sched_yield();
-            }
-            if (g_running && !ring_enqueue(req_queue, &req)) {
-                /* 仍然失败，跳过一帧 */
-            }
-        }
-
-        /* Advance offset */
+        /* 推进 offset */
         offset += g_num_threads * 512;
-        if (offset >= 64 * 1024 * 1024) {  /* 64MB disk */
+        if (offset >= 64 * 1024 * 1024) {
             offset = 0;
         }
-    }
-
-    /* Drain completion queue on exit (don't count latency) */
-    while (ring_dequeue_nb(comp_queue, &req)) {
-        /* Only count IO, not latency during drain */
-        stats->io_completed++;
-        stats->bytes_completed += req.io_size;
     }
 
     return NULL;
@@ -321,7 +408,6 @@ stats_printer(void *arg)
     while (g_running) {
         sleep(1);
 
-        /* Calculate interval stats from global counters */
         uint64_t total_io = 0;
         uint64_t total_bytes = 0;
         for (uint32_t i = 0; i < g_num_threads; i++) {
@@ -363,8 +449,8 @@ print_usage(const char *prog)
     printf("  -t <threads>    Number of threads (default: %d)\n", DEFAULT_NUM_THREADS);
     printf("  -d <depth>      IO depth (default: %d)\n", DEFAULT_IO_DEPTH);
     printf("  -T <sec>        Test duration in seconds (default: %d)\n", DEFAULT_TEST_DURATION_SEC);
-    printf("  -r <latency>    Read latency in microseconds (default: 0)\n");
-    printf("  -w <latency>    Write latency in microseconds (default: 0)\n");
+    printf("  -r <latency>    Read latency in microseconds (default: 100)\n");
+    printf("  -w <latency>    Write latency in microseconds (default: 200)\n");
     printf("  --read          Run read test (sequential)\n");
     printf("  --write         Run write test (sequential)\n");
     printf("  --rand          Run random I/O test (read/write mixed)\n");
@@ -381,8 +467,8 @@ main(int argc, char *argv[])
         .num_threads = DEFAULT_NUM_THREADS,
         .io_depth = DEFAULT_IO_DEPTH,
         .duration_sec = DEFAULT_TEST_DURATION_SEC,
-        .read_latency_us = 0,
-        .write_latency_us = 0,
+        .read_latency_us = 100,
+        .write_latency_us = 200,
         .is_read_test = false,
         .is_write_test = false,
         .is_rand_test = false,
@@ -412,7 +498,6 @@ main(int argc, char *argv[])
         } else if (strcmp(argv[i], "--rand") == 0) {
             opts.is_rand_test = true;
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            /* Parse CPU list */
             char *cpulist = strdup(argv[++i]);
             char *token = strtok(cpulist, ",");
             uint32_t cpus[32];
@@ -443,10 +528,8 @@ main(int argc, char *argv[])
     printf("Threads: %u\n", opts.num_threads);
     printf("IO depth: %u\n", opts.io_depth);
     printf("Duration: %u sec\n", opts.duration_sec);
-    if (opts.read_latency_us > 0 || opts.write_latency_us > 0) {
-        printf("Latency: read=%u us, write=%u us\n",
-               opts.read_latency_us, opts.write_latency_us);
-    }
+    printf("Read latency: %u us\n", opts.read_latency_us);
+    printf("Write latency: %u us\n", opts.write_latency_us);
     if (opts.poller_cpus_count > 0) {
         printf("Poller CPUs:   ");
         for (uint32_t i = 0; i < opts.poller_cpus_count; i++) {
@@ -457,6 +540,7 @@ main(int argc, char *argv[])
 
     g_num_threads = opts.num_threads;
     g_running = true;
+    g_draining = false;
 
     /* Allocate stats */
     g_stats = calloc(opts.num_threads, sizeof(struct thread_stats));
@@ -464,12 +548,12 @@ main(int argc, char *argv[])
         g_stats[i].min_latency_ns = UINT64_MAX;
     }
 
-    /* Allocate queues */
+    /* Allocate queues and delay lists */
     g_req_queues = calloc(opts.num_threads, sizeof(struct ring_buffer));
-    g_comp_queues = calloc(opts.num_threads, sizeof(struct ring_buffer));
+    g_delay_lists = calloc(opts.num_threads, sizeof(struct delay_list));
     for (uint32_t i = 0; i < opts.num_threads; i++) {
         ring_init(&g_req_queues[i], QUEUE_SIZE);
-        ring_init(&g_comp_queues[i], QUEUE_SIZE);
+        delay_list_init(&g_delay_lists[i]);
     }
 
     /* Allocate thread arrays */
@@ -487,15 +571,15 @@ main(int argc, char *argv[])
     pthread_t printer_thread;
     pthread_create(&printer_thread, NULL, stats_printer, &opts.duration_sec);
 
-    /* Create worker and poller threads */
+    /* Create poller and worker threads */
     for (uint32_t i = 0; i < opts.num_threads; i++) {
         worker_ids[i] = i;
         poller_ids[i] = i;
 
-        /* Create poller first */
+        /* Create poller */
         pthread_create(&g_poller_threads[i], NULL, poller_thread, &poller_ids[i]);
 
-        /* Set poller CPU affinity if specified */
+        /* Set poller CPU affinity */
         if (opts.poller_cpus_count > 0 && i < opts.poller_cpus_count) {
             cpu_set_t cpuset;
             CPU_ZERO(&cpuset);
@@ -510,22 +594,16 @@ main(int argc, char *argv[])
     /* Wait for duration */
     sleep(opts.duration_sec);
     g_running = false;
-    g_draining = true;  /* Don't count latency during drain */
+    g_draining = true;
 
-    /* Signal all queue conditions to wake up waiting threads */
+    /* Wake up all threads */
     for (uint32_t i = 0; i < opts.num_threads; i++) {
         pthread_mutex_lock(&g_req_queues[i].mutex);
         pthread_cond_broadcast(&g_req_queues[i].cond);
         pthread_mutex_unlock(&g_req_queues[i].mutex);
-        pthread_mutex_lock(&g_comp_queues[i].mutex);
-        pthread_cond_broadcast(&g_comp_queues[i].cond);
-        pthread_mutex_unlock(&g_comp_queues[i].mutex);
     }
 
-    /* Small delay to let workers drain completions */
-    usleep(100000);  /* 100ms */
-
-    /* Wait for workers first */
+    /* Wait for workers */
     for (uint32_t i = 0; i < opts.num_threads; i++) {
         pthread_join(g_worker_threads[i], NULL);
     }
@@ -582,10 +660,10 @@ main(int argc, char *argv[])
 
     for (uint32_t i = 0; i < opts.num_threads; i++) {
         ring_destroy(&g_req_queues[i]);
-        ring_destroy(&g_comp_queues[i]);
+        delay_list_destroy(&g_delay_lists[i]);
     }
     free(g_req_queues);
-    free(g_comp_queues);
+    free(g_delay_lists);
 
     if (opts.poller_cpus) {
         free(opts.poller_cpus);
