@@ -36,8 +36,8 @@ struct benchmark_opts {
     bool is_read_test;
     bool is_write_test;
     bool is_rand_test;
-    uint32_t *poller_cpus;
-    uint32_t  poller_cpus_count;
+    uint32_t *thread_cpus;       /* CPU cores for all threads (worker + poller) */
+    uint32_t  thread_cpus_count;
 };
 
 /* Per-thread statistics */
@@ -550,7 +550,7 @@ static void print_usage(const char *prog) {
     printf("  -T <sec>        Duration (default: %d)\n", DEFAULT_TEST_DURATION_SEC);
     printf("  -r <us>         Read latency (default: 100)\n");
     printf("  -d <depth>      IO depth per worker (default: 128)\n");
-    printf("  -c <cpus>       Poller CPUs (e.g. 0,2,4,6)\n");
+    printf("  -c <cpus>       CPU cores for all threads (need 2*N for N pairs)\n");
     printf("  -h, --help      Help\n");
 }
 
@@ -561,8 +561,8 @@ int main(int argc, char *argv[])
         .duration_sec = DEFAULT_TEST_DURATION_SEC,
         .read_latency_us = 100,
         .write_latency_us = 200,
-        .poller_cpus = NULL,
-        .poller_cpus_count = 0,
+        .thread_cpus = NULL,
+        .thread_cpus_count = 0,
         .io_depth = 128,
     };
 
@@ -582,9 +582,9 @@ int main(int argc, char *argv[])
             while (t && n < 32) cpus[n++] = atoi(t), t = strtok(NULL, ",");
             free(p);
             if (n > 0) {
-                opts.poller_cpus = calloc(n, sizeof(uint32_t));
-                memcpy(opts.poller_cpus, cpus, n * sizeof(uint32_t));
-                opts.poller_cpus_count = n;
+                opts.thread_cpus = calloc(n, sizeof(uint32_t));
+                memcpy(opts.thread_cpus, cpus, n * sizeof(uint32_t));
+                opts.thread_cpus_count = n;
             }
         }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
@@ -596,9 +596,9 @@ int main(int argc, char *argv[])
     printf("=== IOperf Async Benchmark ===\n");
     printf("Threads: %u, Duration: %u sec, IO depth: %u\n", opts.num_threads, opts.duration_sec, opts.io_depth);
     printf("Read latency: %u us, Write latency: %u us\n", opts.read_latency_us, opts.write_latency_us);
-    if (opts.poller_cpus_count > 0) {
-        printf("Poller CPUs: ");
-        for (uint32_t i = 0; i < opts.poller_cpus_count; i++) printf("%u ", opts.poller_cpus[i]);
+    if (opts.thread_cpus_count > 0) {
+        printf("CPU affinity: ");
+        for (uint32_t i = 0; i < opts.thread_cpus_count; i++) printf("%u ", opts.thread_cpus[i]);
         printf("\n");
     }
 
@@ -634,13 +634,19 @@ int main(int argc, char *argv[])
         worker_ids[i] = i;
         poller_ids[i] = i;
 
+        /* 创建 poller，绑定到前半部分 CPU */
         pthread_create(&g_poller_threads[i], NULL, poller_thread, &poller_ids[i]);
-        if (opts.poller_cpus_count > 0 && i < opts.poller_cpus_count) {
-            cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(opts.poller_cpus[i], &cs);
+        if (opts.thread_cpus_count >= opts.num_threads && i < opts.thread_cpus_count) {
+            cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(opts.thread_cpus[i], &cs);
             pthread_setaffinity_np(g_poller_threads[i], sizeof(cs), &cs);
         }
 
+        /* 创建 worker，绑定到后半部分 CPU (避免与 poller 竞争) */
         pthread_create(&g_worker_threads[i], NULL, worker_thread, &worker_ids[i]);
+        if (opts.thread_cpus_count >= 2 * opts.num_threads && i < opts.num_threads) {
+            cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(opts.thread_cpus[i + opts.num_threads], &cs);
+            pthread_setaffinity_np(g_worker_threads[i], sizeof(cs), &cs);
+        }
     }
 
     sleep(opts.duration_sec);
@@ -686,7 +692,7 @@ int main(int argc, char *argv[])
     }
     free(g_rings);
     free(g_delay_lists);
-    if (opts.poller_cpus) free(opts.poller_cpus);
+    if (opts.thread_cpus) free(opts.thread_cpus);
 
     return 0;
 }
