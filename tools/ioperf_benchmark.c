@@ -57,6 +57,14 @@ struct io_request {
     uint32_t io_size;
     struct thread_stats *stats;
     struct io_request *next;  /* for delay list */
+
+    /* Fields for fill_all_fields simulation */
+    uint64_t field_001, field_002, field_003, field_004, field_005;
+    uint64_t field_006, field_007, field_008, field_009, field_010;
+    uint64_t field_011, field_012, field_013, field_014, field_015;
+    uint64_t field_016, field_017, field_018, field_019, field_020;
+    uint64_t field_021, field_022, field_023, field_024, field_025;
+    uint64_t field_026, field_027, field_028, field_029, field_030;
 };
 
 /* Memory pool for io_request (lock-free stack) */
@@ -75,6 +83,11 @@ struct ring {
 
     /* Per-ring memory pool for this channel */
     struct mem_pool pool;
+
+    /* Rate limiting (token bucket) */
+    uint64_t token_bucket;
+    uint64_t last_time;
+    uint64_t max_bandwidth_bytes;
 };
 
 /* Delay list per poller (sorted by submit time) */
@@ -102,6 +115,10 @@ static void ring_init(struct ring *r, uint32_t size) {
     atomic_init(&r->tail, 0);
     /* Initialize per-ring memory pool */
     pool_init(&r->pool, size);
+    /* Initialize rate limiting */
+    r->token_bucket = 0;
+    r->last_time = 0;
+    r->max_bandwidth_bytes = 0;  /* 0 = unlimited */
 }
 
 /* Ring destroy */
@@ -139,6 +156,86 @@ static struct io_request *ring_dequeue(struct ring *r) {
     struct io_request *req = r->slots[tail];
     atomic_store(&r->tail, (tail + 1) % r->size);
     return req;
+}
+
+/* ============================================================================
+ * fill_all_fields - 模拟真实内存访问和工作负载
+ * ============================================================================ */
+static void
+fill_all_fields(struct io_request *req)
+{
+    req->field_001 = req->offset_blocks;
+    req->field_002 = req->num_blocks;
+    req->field_003 = req->io_size;
+    req->field_004 = req->field_001 + req->field_002;
+    req->field_005 = req->field_003 + req->field_004;
+    req->field_006 = req->field_001 * 2;
+    req->field_007 = req->field_002 * 2;
+    req->field_008 = req->field_003 * 2;
+    req->field_009 = req->field_004 * 2;
+    req->field_010 = req->field_005 * 2;
+    req->field_011 = req->field_001 - req->field_002;
+    req->field_012 = req->field_003 - req->field_004;
+    req->field_013 = req->field_005 - req->field_006;
+    req->field_014 = req->field_007 - req->field_008;
+    req->field_015 = req->field_009 - req->field_010;
+    req->field_016 = req->field_001 & 0xFF;
+    req->field_017 = req->field_002 & 0xFF;
+    req->field_018 = req->field_003 & 0xFF;
+    req->field_019 = req->field_004 & 0xFF;
+    req->field_020 = req->field_005 & 0xFF;
+    req->field_021 = req->field_006 | 0xFF;
+    req->field_022 = req->field_007 | 0xFF;
+    req->field_023 = req->field_008 | 0xFF;
+    req->field_024 = req->field_009 | 0xFF;
+    req->field_025 = req->field_010 | 0xFF;
+    req->field_026 = req->field_001 ^ req->field_002;
+    req->field_027 = req->field_003 ^ req->field_004;
+    req->field_028 = req->field_005 ^ req->field_006;
+    req->field_029 = req->field_007 ^ req->field_008;
+    req->field_030 = req->field_009 ^ req->field_010;
+}
+
+/* ============================================================================
+ * Rate limiting (token bucket)
+ * ============================================================================ */
+
+/* Get CPU ticks per second */
+static uint64_t
+get_ticks_per_second(void)
+{
+    return 1000000000ULL;  /* nanoseconds */
+}
+
+/* Rate limit check - token bucket algorithm */
+static bool
+rate_limit_check(struct ring *ring, uint64_t io_size)
+{
+    uint64_t now = get_time_ns();
+    uint64_t ticks_per_sec = get_ticks_per_second();
+
+    /* Initialize on first call */
+    if (ring->last_time == 0) {
+        ring->last_time = now;
+        ring->token_bucket = ring->max_bandwidth_bytes;
+    }
+
+    uint64_t elapsed = now - ring->last_time;
+
+    if (elapsed > 0) {
+        /* Refill token bucket */
+        uint64_t tokens_to_add = (ring->max_bandwidth_bytes / ticks_per_sec) * elapsed;
+        ring->token_bucket += tokens_to_add;
+        ring->last_time = now;
+    }
+
+    /* Check rate limit */
+    if (ring->token_bucket >= io_size) {
+        ring->token_bucket -= io_size;
+        return true;
+    }
+
+    return false;
 }
 
 /* Delay list init */
@@ -260,6 +357,13 @@ worker_thread(void *arg)
             /* spin-wait */
         }
 
+        /* Rate limit check (if bandwidth configured) */
+        if (ring->max_bandwidth_bytes > 0) {
+            while (!rate_limit_check(ring, 512)) {
+                /* spin-wait for token bucket */
+            }
+        }
+
         /* 从内存池分配请求 */
         struct io_request *req = pool_alloc(&ring->pool);
         if (req == NULL) {
@@ -310,12 +414,8 @@ poller_thread(void *arg)
             uint64_t now = get_time_ns();
             uint64_t latency = now - ready->submit_ns;
 
-            /* 模拟内存访问 */
-            volatile uint64_t sum = 0;
-            for (int i = 0; i < 128; i++) {
-                sum += ready->offset_blocks + i;
-            }
-            (void)sum;
+            /* 模拟内存访问和工作负载 */
+            fill_all_fields(ready);
 
             /* 统计 - 只在运行阶段，非 drain 阶段 */
             atomic_fetch_add(&g_total_processed, 1);
