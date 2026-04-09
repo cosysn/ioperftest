@@ -1,0 +1,55 @@
+name: Build Benchmark
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
+      - name: Build benchmark
+        run: |
+          make clean
+          make benchmark
+
+      - name: Build standalone test
+        run: |
+          make standalone
+
+      - name: Upload benchmark artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ioperf_benchmark
+          path: ioperf_benchmark
+          retention-days: 30
+
+      - name: Upload standalone test artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test_bdev_standalone
+          path: test_bdev_standalone
+          retention-days: 30
+
+      - name: Upload all artifacts (on release)
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v2
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ./ioperf_benchmark
+          asset_name: ioperf_benchmark
+          asset_content_type: application/octet-stream
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
