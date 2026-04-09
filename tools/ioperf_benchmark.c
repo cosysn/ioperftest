@@ -302,21 +302,24 @@ stats_printer(void *arg)
     while (g_running) {
         sleep(1);
 
-        uint64_t total_io = 0, total_bytes = 0;
+        uint64_t total_io = 0, total_bytes = 0, total_lat_ns = 0;
         for (uint32_t i = 0; i < g_num_threads; i++) {
             total_io += g_stats[i].io_completed;
             total_bytes += g_stats[i].bytes_completed;
+            total_lat_ns += g_stats[i].total_latency_ns;
         }
 
-        static uint64_t last_io = 0, last_bytes = 0;
+        static uint64_t last_io = 0, last_bytes = 0, last_lat_ns = 0;
         uint64_t interval_io = total_io - last_io;
         uint64_t interval_bytes = total_bytes - last_bytes;
+        uint64_t interval_lat_ns = total_lat_ns - last_lat_ns;
         last_io = total_io;
         last_bytes = total_bytes;
+        last_lat_ns = total_lat_ns;
 
         double iops = (double)interval_io;
         double mbps = (double)interval_bytes / (1024.0 * 1024.0);
-        double avg_lat = (interval_io > 0) ? (double)interval_bytes / interval_io / 1000.0 : 0;
+        double avg_lat = (interval_io > 0) ? (double)interval_lat_ns / interval_io / 1000.0 : 0;
 
         printf("%-6u %10.0f %10.0f %10.0f %10.2f %10.2f\n",
                sec, iops, iops, 0.0, mbps, avg_lat);
