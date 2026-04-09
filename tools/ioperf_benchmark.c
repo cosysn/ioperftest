@@ -134,27 +134,29 @@ static bool ring_empty(struct ring *r) {
 
 /* Ring enqueue (非阻塞) - 返回 true 成功 */
 static bool ring_enqueue(struct ring *r, struct io_request *req) {
-    uint32_t head = atomic_load(&r->head);
+    uint32_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
     uint32_t next_head = (head + 1) % r->size;
 
-    if (next_head == atomic_load(&r->tail)) {
+    if (next_head == atomic_load_explicit(&r->tail, memory_order_relaxed)) {
         return false;  /* 队列满 */
     }
 
     r->slots[head] = req;
-    atomic_store(&r->head, next_head);
+    /* Release barrier: 确保 slots[head] 写入对消费者可见 */
+    atomic_store_explicit(&r->head, next_head, memory_order_release);
     return true;
 }
 
 /* Ring dequeue (非阻塞) - 返回 NULL 表示空 */
 static struct io_request *ring_dequeue(struct ring *r) {
-    if (ring_empty(r)) {
+    uint32_t tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
+    if (atomic_load_explicit(&r->head, memory_order_relaxed) == tail) {
         return NULL;
     }
 
-    uint32_t tail = atomic_load(&r->tail);
     struct io_request *req = r->slots[tail];
-    atomic_store(&r->tail, (tail + 1) % r->size);
+    /* Acquire barrier: 确保看到生产者的写入 */
+    atomic_store_explicit(&r->tail, (tail + 1) % r->size, memory_order_release);
     return req;
 }
 
@@ -207,7 +209,7 @@ ioperf_reg_access(void)
     uint64_t start_ticks = get_time_ns();
     /* 500ns fixed delay */
     uint64_t delay_ns = 500;  /* 500 nanoseconds */
-    static uint32_t dummy = 0;
+    uint32_t dummy = 0;  /* 局部变量，无数据竞争 */
 
     /* 4 register accesses, ~500ns each = ~2000ns total */
     for (i = 0; i < 4; i++) {
@@ -634,16 +636,16 @@ int main(int argc, char *argv[])
         worker_ids[i] = i;
         poller_ids[i] = i;
 
-        /* 创建 poller，绑定到前半部分 CPU */
+        /* 创建 poller，绑定到 CPU[i] */
         pthread_create(&g_poller_threads[i], NULL, poller_thread, &poller_ids[i]);
-        if (opts.thread_cpus_count >= opts.num_threads && i < opts.thread_cpus_count) {
+        if (opts.thread_cpus_count > i) {
             cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(opts.thread_cpus[i], &cs);
             pthread_setaffinity_np(g_poller_threads[i], sizeof(cs), &cs);
         }
 
-        /* 创建 worker，绑定到后半部分 CPU (避免与 poller 竞争) */
+        /* 创建 worker，绑定到 CPU[i + num_threads] (如果可用) */
         pthread_create(&g_worker_threads[i], NULL, worker_thread, &worker_ids[i]);
-        if (opts.thread_cpus_count >= 2 * opts.num_threads && i < opts.num_threads) {
+        if (opts.thread_cpus_count > opts.num_threads + i) {
             cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(opts.thread_cpus[i + opts.num_threads], &cs);
             pthread_setaffinity_np(g_worker_threads[i], sizeof(cs), &cs);
         }
