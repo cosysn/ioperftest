@@ -7,8 +7,6 @@ on:
       - 'v*'
   pull_request:
     branches: [ main ]
-  release:
-    types: [ published ]
 
 jobs:
   build:
@@ -34,24 +32,21 @@ jobs:
       - name: Upload benchmark artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ioperf_benchmark
+          name: ioperf_benchmark-${{ github.ref_name }}
           path: ioperf_benchmark
           retention-days: 30
 
       - name: Upload standalone test artifact
         uses: actions/upload-artifact@v4
         with:
-          name: test_bdev_standalone
+          name: test_bdev_standalone-${{ github.ref_name }}
           path: test_bdev_standalone
           retention-days: 30
 
-      - name: Create Release Asset
-        if: github.event_name == 'release'
-        run: |
-          tar -czf ioperf_benchmark.tar.gz ioperf_benchmark test_bdev_standalone
-
-      - name: Upload Release Asset
-        if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: ncipollo/release-action@v1
         with:
-          files: ioperf_benchmark.tar.gz
+          artifacts: "ioperf_benchmark,test_bdev_standalone"
+          artifactErrorsFailBuild: true
+          generateReleaseNotes: true
