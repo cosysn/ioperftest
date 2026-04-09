@@ -36,6 +36,9 @@ struct benchmark_opts {
     bool is_read_test;
     bool is_write_test;
     bool is_rand_test;
+    bool enable_fill;        /* enable fill_all_fields simulation */
+    bool enable_reg_access;  /* enable ioperf_reg_access */
+    bool enable_barrier;    /* enable ioperf_mem_barrier */
     uint32_t *thread_cpus;       /* CPU cores for all threads (worker + poller) */
     uint32_t  thread_cpus_count;
 };
@@ -383,6 +386,9 @@ static uint64_t g_write_delay_ns;
 static _Atomic uint64_t g_total_processed;
 static _Atomic uint32_t g_in_flight;  /* current in-flight IO count */
 static uint32_t g_target_depth;       /* target IO depth per worker */
+static bool g_enable_fill;
+static bool g_enable_reg_access;
+static bool g_enable_barrier;
 
 /* Worker thread - 维持固定队列深度 */
 static void *
@@ -456,9 +462,9 @@ poller_thread(void *arg)
             uint64_t latency = now - ready->submit_ns;
 
             /* 模拟内存访问和工作负载 */
-            fill_all_fields(ready);
-            ioperf_reg_access();    /* 模拟硬件寄存器访问延迟 (~2us) */
-            ioperf_mem_barrier();    /* 内存屏障 */
+            if (g_enable_fill) fill_all_fields(ready);
+            if (g_enable_reg_access) ioperf_reg_access();
+            if (g_enable_barrier) ioperf_mem_barrier();
 
             /* 统计 - 只在运行阶段，非 drain 阶段 */
             atomic_fetch_add(&g_total_processed, 1);
@@ -553,6 +559,10 @@ static void print_usage(const char *prog) {
     printf("  -r <us>         Read latency (default: 100)\n");
     printf("  -d <depth>      IO depth per worker (default: 128)\n");
     printf("  -c <cpus>       CPU cores for all threads (need 2*N for N pairs)\n");
+    printf("  --no-fill       Disable fill_all_fields simulation\n");
+    printf("  --no-reg        Disable register access delay\n");
+    printf("  --no-barrier    Disable memory barrier\n");
+    printf("  --no-sim        Disable all simulations\n");
     printf("  -h, --help      Help\n");
 }
 
@@ -566,6 +576,9 @@ int main(int argc, char *argv[])
         .thread_cpus = NULL,
         .thread_cpus_count = 0,
         .io_depth = 128,
+        .enable_fill = true,
+        .enable_reg_access = true,
+        .enable_barrier = true,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -589,6 +602,14 @@ int main(int argc, char *argv[])
                 opts.thread_cpus_count = n;
             }
         }
+        else if (strcmp(argv[i], "--no-fill") == 0) opts.enable_fill = false;
+        else if (strcmp(argv[i], "--no-reg") == 0) opts.enable_reg_access = false;
+        else if (strcmp(argv[i], "--no-barrier") == 0) opts.enable_barrier = false;
+        else if (strcmp(argv[i], "--no-sim") == 0) {
+            opts.enable_fill = false;
+            opts.enable_reg_access = false;
+            opts.enable_barrier = false;
+        }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
@@ -610,6 +631,9 @@ int main(int argc, char *argv[])
     g_read_delay_ns = opts.read_latency_us * 1000ULL;
     g_write_delay_ns = opts.write_latency_us * 1000ULL;
     g_target_depth = opts.io_depth;
+    g_enable_fill = opts.enable_fill;
+    g_enable_reg_access = opts.enable_reg_access;
+    g_enable_barrier = opts.enable_barrier;
     atomic_store(&g_in_flight, 0);
 
     g_stats = calloc(opts.num_threads, sizeof(struct thread_stats));
