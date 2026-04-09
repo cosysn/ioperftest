@@ -197,6 +197,45 @@ fill_all_fields(struct io_request *req)
 }
 
 /* ============================================================================
+ * ioperf_reg_access - 模拟硬件寄存器访问延迟 (~500ns per access)
+ * ============================================================================ */
+static void
+ioperf_reg_access(void)
+{
+    uint32_t val;
+    int i;
+    uint64_t start_ticks = get_time_ns();
+    /* 500ns fixed delay */
+    uint64_t delay_ticks = 500000;  /* 500ns in nanoseconds */
+    static uint32_t dummy = 0;
+
+    /* 4 register accesses, ~500ns each = ~2000ns total */
+    for (i = 0; i < 4; i++) {
+        val = dummy;  /* read */
+        dummy = val;  /* write */
+        /* Busy wait fixed 500ns */
+        while ((get_time_ns() - start_ticks) < delay_ticks) {
+            __asm__ volatile("" ::: "memory");
+        }
+        start_ticks = get_time_ns();
+    }
+}
+
+/* ============================================================================
+ * ioperf_mem_barrier - 内存屏障 (8次)
+ * ============================================================================ */
+static void
+ioperf_mem_barrier(void)
+{
+    int i;
+
+    /* 8 memory barriers */
+    for (i = 0; i < 8; i++) {
+        __sync_synchronize();
+    }
+}
+
+/* ============================================================================
  * Rate limiting (token bucket)
  * ============================================================================ */
 
@@ -416,6 +455,8 @@ poller_thread(void *arg)
 
             /* 模拟内存访问和工作负载 */
             fill_all_fields(ready);
+            ioperf_reg_access();    /* 模拟硬件寄存器访问延迟 (~2us) */
+            ioperf_mem_barrier();    /* 内存屏障 */
 
             /* 统计 - 只在运行阶段，非 drain 阶段 */
             atomic_fetch_add(&g_total_processed, 1);
