@@ -43,13 +43,13 @@ jobs:
           path: test_bdev_standalone
           retention-days: 30
 
-      - name: Upload all artifacts (on release)
+      - name: Create Release Asset
         if: github.event_name == 'release'
-        uses: actions/upload-release-asset@v2
+        run: |
+          tar -czf ioperf_benchmark.tar.gz ioperf_benchmark test_bdev_standalone
+
+      - name: Upload Release Asset
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
         with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: ./ioperf_benchmark
-          asset_name: ioperf_benchmark
-          asset_content_type: application/octet-stream
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: ioperf_benchmark.tar.gz
