@@ -206,7 +206,7 @@ ioperf_reg_access(void)
     int i;
     uint64_t start_ticks = get_time_ns();
     /* 500ns fixed delay */
-    uint64_t delay_ticks = 500000;  /* 500ns in nanoseconds */
+    uint64_t delay_ns = 500;  /* 500 nanoseconds */
     static uint32_t dummy = 0;
 
     /* 4 register accesses, ~500ns each = ~2000ns total */
@@ -214,7 +214,7 @@ ioperf_reg_access(void)
         val = dummy;  /* read */
         dummy = val;  /* write */
         /* Busy wait fixed 500ns */
-        while ((get_time_ns() - start_ticks) < delay_ticks) {
+        while ((get_time_ns() - start_ticks) < delay_ns) {
             __asm__ volatile("" ::: "memory");
         }
         start_ticks = get_time_ns();
