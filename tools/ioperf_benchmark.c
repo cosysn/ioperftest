@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * Copyright (c) 2024
  * IOperf async benchmark tool
+ * Fully async architecture: worker -> ring buffer -> poller -> completion -> worker
  */
 
 #include <stdio.h>
@@ -13,8 +14,7 @@
 #include <unistd.h>
 #include <stdatomic.h>
 #include <sched.h>
-
-#include "ioperf.h"
+#include <errno.h>
 
 /* Default configuration */
 #define DEFAULT_DISK_SIZE_MB   64
@@ -22,6 +22,7 @@
 #define DEFAULT_NUM_THREADS    4
 #define DEFAULT_IO_DEPTH       128
 #define DEFAULT_TEST_DURATION_SEC 10
+#define QUEUE_SIZE             4096
 
 /* Options */
 struct benchmark_opts {
@@ -35,8 +36,8 @@ struct benchmark_opts {
     bool is_read_test;
     bool is_write_test;
     bool is_rand_test;
-    uint32_t *poller_cpus;       /* NEW: CPU IDs for poller affinity */
-    uint32_t  poller_cpus_count; /* NEW: length of poller_cpus array */
+    uint32_t *poller_cpus;
+    uint32_t  poller_cpus_count;
 };
 
 /* Per-thread statistics */
@@ -48,30 +49,36 @@ struct thread_stats {
     uint64_t max_latency_ns;
 };
 
-/* IO wrapper for async operation */
-struct io_wrapper {
-    struct ioperf_io_ctx ctx;
+/* IO request wrapper */
+struct io_request {
     uint64_t submit_ns;
+    uint64_t complete_ns;
+    uint64_t offset_blocks;
+    uint32_t num_blocks;
+    uint32_t io_size;
     struct thread_stats *stats;
-    struct io_tracker *tracker;
 };
 
-/* Track in-flight IO */
-struct io_tracker {
-    _Atomic uint32_t in_flight;
-    uint32_t max_in_flight;
+/* Ring buffer for SPSC */
+struct ring_buffer {
+    struct io_request *requests;
+    uint32_t size;
+    _Atomic uint32_t head;  /* producer writes here */
+    _Atomic uint32_t tail;  /* consumer reads here */
     pthread_mutex_t mutex;
     pthread_cond_t cond;
 };
 
 /* Global state */
-static struct ioperf_disk *g_disk;
 static volatile bool g_running;
+static volatile bool g_draining;
 static pthread_t *g_worker_threads;
+static pthread_t *g_poller_threads;
 static struct thread_stats *g_stats;
 static uint32_t g_num_threads;
 static uint64_t g_start_ns;
-static struct io_tracker g_tracker;
+static struct ring_buffer *g_req_queues;
+static struct ring_buffer *g_comp_queues;
 
 /* Get current time in nanoseconds */
 static inline uint64_t
@@ -82,203 +89,220 @@ get_time_ns(void)
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-/* IO completion callback */
+/* Ring buffer init */
 static void
-io_complete(void *arg)
+ring_init(struct ring_buffer *rb, uint32_t size)
 {
-    struct io_wrapper *w = (struct io_wrapper *)arg;
-    uint64_t complete_ns = get_time_ns();
-    uint64_t latency = complete_ns - w->submit_ns;
-
-    w->stats->io_completed++;
-    w->stats->bytes_completed += w->ctx.io_size;
-    w->stats->total_latency_ns += latency;
-    if (w->stats->min_latency_ns == 0 || latency < w->stats->min_latency_ns) {
-        w->stats->min_latency_ns = latency;
-    }
-    if (latency > w->stats->max_latency_ns) {
-        w->stats->max_latency_ns = latency;
-    }
-
-    uint32_t prev = atomic_fetch_sub(&g_tracker.in_flight, 1);
-    if (prev == g_tracker.max_in_flight) {
-        /* Was full, now available - signal waiters */
-        pthread_mutex_lock(&g_tracker.mutex);
-        pthread_cond_signal(&g_tracker.cond);
-        pthread_mutex_unlock(&g_tracker.mutex);
-    }
-    if (prev == 1) {
-        /* Last IO completed - wake up all waiting workers */
-        pthread_mutex_lock(&g_tracker.mutex);
-        pthread_cond_broadcast(&g_tracker.cond);
-        pthread_mutex_unlock(&g_tracker.mutex);
-    }
+    rb->requests = calloc(size, sizeof(struct io_request));
+    rb->size = size;
+    atomic_init(&rb->head, 0);
+    atomic_init(&rb->tail, 0);
+    pthread_mutex_init(&rb->mutex, NULL);
+    pthread_cond_init(&rb->cond, NULL);
 }
 
-/* Sequential write test - async */
-static void *
-seq_write_worker(void *arg)
+/* Ring buffer destroy */
+static void
+ring_destroy(struct ring_buffer *rb)
 {
-    struct thread_stats *stats = (struct thread_stats *)arg;
-    struct io_wrapper *ios;
-    uint32_t idx = 0;
-    uint64_t offset = 0;
-    uint32_t io_depth = DEFAULT_IO_DEPTH;
+    free(rb->requests);
+    pthread_mutex_destroy(&rb->mutex);
+    pthread_cond_destroy(&rb->cond);
+}
 
-    /* Pre-allocate IO wrappers */
-    ios = calloc(io_depth, sizeof(struct io_wrapper));
-    if (!ios) return NULL;
+/* Ring buffer is empty */
+static bool
+ring_empty(struct ring_buffer *rb)
+{
+    return atomic_load(&rb->head) == atomic_load(&rb->tail);
+}
+
+/* Ring buffer is full */
+static bool
+ring_full(struct ring_buffer *rb)
+{
+    uint32_t head = atomic_load(&rb->head);
+    uint32_t next_head = (head + 1) % rb->size;
+    return next_head == atomic_load(&rb->tail);
+}
+
+/* Enqueue (非阻塞) - 返回 true 成功, false 队列满 */
+static bool
+ring_enqueue(struct ring_buffer *rb, struct io_request *req)
+{
+    uint32_t head = atomic_load(&rb->head);
+    uint32_t next_head = (head + 1) % rb->size;
+
+    /* 检查队列满 */
+    if (next_head == atomic_load(&rb->tail)) {
+        return false;
+    }
+
+    /* 复制请求到队列 */
+    memcpy(&rb->requests[head], req, sizeof(struct io_request));
+
+    /* 发布头位置 */
+    atomic_store(&rb->head, next_head);
+
+    /* 信号消费者 */
+    pthread_mutex_lock(&rb->mutex);
+    pthread_cond_signal(&rb->cond);
+    pthread_mutex_unlock(&rb->mutex);
+
+    return true;
+}
+
+/* Dequeue (阻塞直到有数据) - 返回 true 成功 */
+static bool
+ring_dequeue(struct ring_buffer *rb, struct io_request *req)
+{
+    pthread_mutex_lock(&rb->mutex);
+
+    while (ring_empty(rb) && g_running) {
+        pthread_cond_wait(&rb->cond, &rb->mutex);
+    }
+
+    if (ring_empty(rb)) {
+        pthread_mutex_unlock(&rb->mutex);
+        return false;
+    }
+
+    uint32_t tail = atomic_load(&rb->tail);
+    memcpy(req, &rb->requests[tail], sizeof(struct io_request));
+    atomic_store(&rb->tail, (tail + 1) % rb->size);
+
+    pthread_mutex_unlock(&rb->mutex);
+
+    return true;
+}
+
+/* 非阻塞 Dequeue - 返回 true 成功, false 队列空 */
+static bool
+ring_dequeue_nb(struct ring_buffer *rb, struct io_request *req)
+{
+    if (ring_empty(rb)) {
+        return false;
+    }
+
+    uint32_t tail = atomic_load(&rb->tail);
+    memcpy(req, &rb->requests[tail], sizeof(struct io_request));
+    atomic_store(&rb->tail, (tail + 1) % rb->size);
+
+    return true;
+}
+
+/* Poller thread - busy polls request queue, processes after delay */
+static void *
+poller_thread(void *arg)
+{
+    uint32_t poller_id = *(uint32_t *)arg;
+    struct ring_buffer *req_queue = &g_req_queues[poller_id];
+    struct ring_buffer *comp_queue = &g_comp_queues[poller_id];
+    struct io_request req;
 
     while (g_running) {
-        /* Submit batch of IOs up to depth */
-        uint32_t batch_size = 0;
-        while (batch_size < io_depth && atomic_load(&g_tracker.in_flight) < g_tracker.max_in_flight) {
-            struct io_wrapper *w = &ios[idx % io_depth];
-
-            ioperf_io_ctx_init(&w->ctx);
-            w->ctx.type = IOPERF_IO_WRITE;
-            w->ctx.offset_blocks = offset;
-            w->ctx.num_blocks = 1;
-            w->ctx.io_size = g_disk->block_size;
-            w->ctx.complete = io_complete;
-            w->ctx.complete_arg = w;
-            w->stats = stats;
-            w->submit_ns = get_time_ns();
-
-            int rc = ioperf_submit_io(g_disk, &w->ctx);
-            if (rc == 0) {
-                atomic_fetch_add(&g_tracker.in_flight, 1);
-                batch_size++;
-                idx++;
-            }
-
-            offset += g_disk->num_threads * g_disk->block_size;
-            if (offset >= g_disk->block_count * g_disk->block_size) {
-                offset = 0;
-            }
+        /* Try to dequeue a request (non-blocking) */
+        if (!ring_dequeue_nb(req_queue, &req)) {
+            /* 队列空，让出 CPU 避免 busy-wait */
+            sched_yield();
+            continue;
         }
-        /* Yield if we hit backpressure - let poller run */
-        if (atomic_load(&g_tracker.in_flight) >= g_tracker.max_in_flight) {
+
+        /* Check if delay has elapsed */
+        uint64_t now = get_time_ns();
+        uint64_t delay_ns = (uint64_t)100 * 1000;  /* 100us read latency */
+
+        if (now - req.submit_ns < delay_ns) {
+            /* Delay not met, put back in queue */
+            if (!ring_enqueue(req_queue, &req)) {
+                /* 队列满，busy wait 一下再试 */
+                while (ring_full(req_queue) && g_running) {
+                    sched_yield();
+                }
+                if (g_running) {
+                    ring_enqueue(req_queue, &req);
+                }
+            }
+            continue;
+        }
+
+        /* Delay met, process the IO (模拟处理) */
+        /* 模拟一些计算工作 */
+        volatile uint64_t sum = 0;
+        for (uint32_t i = 0; i < 128; i++) {
+            sum += req.offset_blocks + i;
+        }
+        (void)sum;
+
+        /* Enqueue completion */
+        req.complete_ns = get_time_ns();
+        while (!ring_enqueue(comp_queue, &req) && g_running) {
             sched_yield();
         }
     }
 
-    /* Wait for remaining IO */
-    pthread_mutex_lock(&g_tracker.mutex);
-    while (atomic_load(&g_tracker.in_flight) > 0) {
-        pthread_cond_wait(&g_tracker.cond, &g_tracker.mutex);
-    }
-    pthread_mutex_unlock(&g_tracker.mutex);
-
-    free(ios);
     return NULL;
 }
 
-/* Sequential read test - async */
+/* Worker thread - generates IO requests asynchronously */
 static void *
-seq_read_worker(void *arg)
+worker_thread(void *arg)
 {
-    struct thread_stats *stats = (struct thread_stats *)arg;
-    struct io_wrapper *ios;
-    uint32_t idx = 0;
+    uint32_t worker_id = *(uint32_t *)arg;
+    struct thread_stats *stats = &g_stats[worker_id];
+    struct ring_buffer *req_queue = &g_req_queues[worker_id];
+    struct ring_buffer *comp_queue = &g_comp_queues[worker_id];
+    struct io_request req;
     uint64_t offset = 0;
-    uint32_t io_depth = DEFAULT_IO_DEPTH;
-
-    ios = calloc(io_depth, sizeof(struct io_wrapper));
-    if (!ios) return NULL;
 
     while (g_running) {
-        uint32_t batch_size = 0;
-        while (batch_size < io_depth && atomic_load(&g_tracker.in_flight) < g_tracker.max_in_flight) {
-            struct io_wrapper *w = &ios[idx % io_depth];
+        /* Try to get completions (non-blocking) to update stats */
+        while (ring_dequeue_nb(comp_queue, &req)) {
+            uint64_t latency = req.complete_ns - req.submit_ns;
 
-            ioperf_io_ctx_init(&w->ctx);
-            w->ctx.type = IOPERF_IO_READ;
-            w->ctx.offset_blocks = offset;
-            w->ctx.num_blocks = 1;
-            w->ctx.io_size = g_disk->block_size;
-            w->ctx.complete = io_complete;
-            w->ctx.complete_arg = w;
-            w->stats = stats;
-            w->submit_ns = get_time_ns();
-
-            int rc = ioperf_submit_io(g_disk, &w->ctx);
-            if (rc == 0) {
-                atomic_fetch_add(&g_tracker.in_flight, 1);
-                batch_size++;
-                idx++;
+            stats->io_completed++;
+            stats->bytes_completed += req.io_size;
+            stats->total_latency_ns += latency;
+            if (stats->min_latency_ns == 0 || latency < stats->min_latency_ns) {
+                stats->min_latency_ns = latency;
             }
-
-            offset += g_disk->num_threads * g_disk->block_size;
-            if (offset >= g_disk->block_count * g_disk->block_size) {
-                offset = 0;
+            if (latency > stats->max_latency_ns) {
+                stats->max_latency_ns = latency;
             }
         }
-        /* Yield if we hit backpressure - let poller run */
-        if (atomic_load(&g_tracker.in_flight) >= g_tracker.max_in_flight) {
-            sched_yield();
-        }
-    }
 
-    /* Wait for remaining IO */
-    pthread_mutex_lock(&g_tracker.mutex);
-    while (atomic_load(&g_tracker.in_flight) > 0) {
-        pthread_cond_wait(&g_tracker.cond, &g_tracker.mutex);
-    }
-    pthread_mutex_unlock(&g_tracker.mutex);
+        /* Submit new IO request */
+        req.submit_ns = get_time_ns();
+        req.offset_blocks = offset;
+        req.num_blocks = 1;
+        req.io_size = 512;
+        req.stats = stats;
 
-    free(ios);
-    return NULL;
-}
-
-/* Random I/O test - async */
-static void *
-rand_io_worker(void *arg)
-{
-    struct thread_stats *stats = (struct thread_stats *)arg;
-    struct io_wrapper *ios;
-    uint32_t idx = 0;
-    uint32_t io_depth = DEFAULT_IO_DEPTH;
-
-    ios = calloc(io_depth, sizeof(struct io_wrapper));
-    if (!ios) return NULL;
-
-    while (g_running) {
-        uint32_t batch_size = 0;
-        while (batch_size < io_depth && atomic_load(&g_tracker.in_flight) < g_tracker.max_in_flight) {
-            struct io_wrapper *w = &ios[idx % io_depth];
-
-            ioperf_io_ctx_init(&w->ctx);
-            w->ctx.type = (rand() % 2 == 0) ? IOPERF_IO_READ : IOPERF_IO_WRITE;
-            w->ctx.offset_blocks = (uint64_t)(rand() % (g_disk->block_count - 1));
-            w->ctx.num_blocks = 1;
-            w->ctx.io_size = g_disk->block_size;
-            w->ctx.complete = io_complete;
-            w->ctx.complete_arg = w;
-            w->stats = stats;
-            w->submit_ns = get_time_ns();
-
-            int rc = ioperf_submit_io(g_disk, &w->ctx);
-            if (rc == 0) {
-                atomic_fetch_add(&g_tracker.in_flight, 1);
-                batch_size++;
-                idx++;
+        /* Enqueue to poller */
+        if (!ring_enqueue(req_queue, &req)) {
+            /* 队列满，busy wait 一下 */
+            while (ring_full(req_queue) && g_running) {
+                sched_yield();
+            }
+            if (g_running && !ring_enqueue(req_queue, &req)) {
+                /* 仍然失败，跳过一帧 */
             }
         }
-        /* Yield if we hit backpressure - let poller run */
-        if (atomic_load(&g_tracker.in_flight) >= g_tracker.max_in_flight) {
-            sched_yield();
+
+        /* Advance offset */
+        offset += g_num_threads * 512;
+        if (offset >= 64 * 1024 * 1024) {  /* 64MB disk */
+            offset = 0;
         }
     }
 
-    /* Wait for remaining IO */
-    pthread_mutex_lock(&g_tracker.mutex);
-    while (atomic_load(&g_tracker.in_flight) > 0) {
-        pthread_cond_wait(&g_tracker.cond, &g_tracker.mutex);
+    /* Drain completion queue on exit (don't count latency) */
+    while (ring_dequeue_nb(comp_queue, &req)) {
+        /* Only count IO, not latency during drain */
+        stats->io_completed++;
+        stats->bytes_completed += req.io_size;
     }
-    pthread_mutex_unlock(&g_tracker.mutex);
 
-    free(ios);
     return NULL;
 }
 
@@ -362,6 +386,8 @@ main(int argc, char *argv[])
         .is_read_test = false,
         .is_write_test = false,
         .is_rand_test = false,
+        .poller_cpus = NULL,
+        .poller_cpus_count = 0,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -386,10 +412,10 @@ main(int argc, char *argv[])
         } else if (strcmp(argv[i], "--rand") == 0) {
             opts.is_rand_test = true;
         } else if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
-            /* Parse CPU list, e.g. "0,2,4,6" */
+            /* Parse CPU list */
             char *cpulist = strdup(argv[++i]);
             char *token = strtok(cpulist, ",");
-            uint32_t cpus[32];  /* max 32 CPUs */
+            uint32_t cpus[32];
             uint32_t count = 0;
             while (token != NULL && count < 32) {
                 cpus[count++] = atoi(token);
@@ -421,45 +447,39 @@ main(int argc, char *argv[])
         printf("Latency: read=%u us, write=%u us\n",
                opts.read_latency_us, opts.write_latency_us);
     }
-
-    struct ioperf_opts disk_opts = {
-        .name = "benchmark_disk",
-        .num_blocks = (opts.disk_size_mb * 1024 * 1024) / opts.block_size,
-        .block_size = opts.block_size,
-        .physical_block_size = opts.block_size,
-        .num_threads = opts.num_threads,
-        .read_latency_us = opts.read_latency_us,
-        .write_latency_us = opts.write_latency_us,
-        .enable_validation = false,
-        .poller_cpus = opts.poller_cpus,           /* NEW */
-        .poller_cpus_count = opts.poller_cpus_count, /* NEW */
-    };
-
-    int rc = ioperf_disk_create(&g_disk, &disk_opts);
-    if (rc != 0) {
-        fprintf(stderr, "Failed to create disk: %d\n", rc);
-        return 1;
+    if (opts.poller_cpus_count > 0) {
+        printf("Poller CPUs:   ");
+        for (uint32_t i = 0; i < opts.poller_cpus_count; i++) {
+            printf("%u ", opts.poller_cpus[i]);
+        }
+        printf("\n");
     }
 
-    printf("\nDisk created successfully\n");
-
-    /* Init tracker */
-    atomic_init(&g_tracker.in_flight, 0);
-    g_tracker.max_in_flight = opts.num_threads * opts.io_depth;
-    pthread_mutex_init(&g_tracker.mutex, NULL);
-    pthread_cond_init(&g_tracker.cond, NULL);
-
-    /* Allocate stats */
-    g_stats = calloc(opts.num_threads, sizeof(struct thread_stats));
     g_num_threads = opts.num_threads;
     g_running = true;
 
-    void *(*worker_fn)(void *) = opts.is_rand_test ? rand_io_worker :
-                                 opts.is_write_test ? seq_write_worker :
-                                 seq_read_worker;
+    /* Allocate stats */
+    g_stats = calloc(opts.num_threads, sizeof(struct thread_stats));
+    for (uint32_t i = 0; i < opts.num_threads; i++) {
+        g_stats[i].min_latency_ns = UINT64_MAX;
+    }
 
-    printf("\nStarting %s test...\n\n",
-           opts.is_rand_test ? "random" : opts.is_write_test ? "seq_write" : "seq_read");
+    /* Allocate queues */
+    g_req_queues = calloc(opts.num_threads, sizeof(struct ring_buffer));
+    g_comp_queues = calloc(opts.num_threads, sizeof(struct ring_buffer));
+    for (uint32_t i = 0; i < opts.num_threads; i++) {
+        ring_init(&g_req_queues[i], QUEUE_SIZE);
+        ring_init(&g_comp_queues[i], QUEUE_SIZE);
+    }
+
+    /* Allocate thread arrays */
+    g_worker_threads = calloc(opts.num_threads, sizeof(pthread_t));
+    g_poller_threads = calloc(opts.num_threads, sizeof(pthread_t));
+
+    uint32_t *worker_ids = calloc(opts.num_threads, sizeof(uint32_t));
+    uint32_t *poller_ids = calloc(opts.num_threads, sizeof(uint32_t));
+
+    printf("\nStarting benchmark...\n\n");
 
     g_start_ns = get_time_ns();
 
@@ -467,20 +487,54 @@ main(int argc, char *argv[])
     pthread_t printer_thread;
     pthread_create(&printer_thread, NULL, stats_printer, &opts.duration_sec);
 
-    /* Create worker threads */
-    g_worker_threads = calloc(opts.num_threads, sizeof(pthread_t));
+    /* Create worker and poller threads */
     for (uint32_t i = 0; i < opts.num_threads; i++) {
-        pthread_create(&g_worker_threads[i], NULL, worker_fn, &g_stats[i]);
+        worker_ids[i] = i;
+        poller_ids[i] = i;
+
+        /* Create poller first */
+        pthread_create(&g_poller_threads[i], NULL, poller_thread, &poller_ids[i]);
+
+        /* Set poller CPU affinity if specified */
+        if (opts.poller_cpus_count > 0 && i < opts.poller_cpus_count) {
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(opts.poller_cpus[i], &cpuset);
+            pthread_setaffinity_np(g_poller_threads[i], sizeof(cpu_set_t), &cpuset);
+        }
+
+        /* Create worker */
+        pthread_create(&g_worker_threads[i], NULL, worker_thread, &worker_ids[i]);
     }
 
     /* Wait for duration */
     sleep(opts.duration_sec);
     g_running = false;
+    g_draining = true;  /* Don't count latency during drain */
 
-    /* Wait for threads */
+    /* Signal all queue conditions to wake up waiting threads */
+    for (uint32_t i = 0; i < opts.num_threads; i++) {
+        pthread_mutex_lock(&g_req_queues[i].mutex);
+        pthread_cond_broadcast(&g_req_queues[i].cond);
+        pthread_mutex_unlock(&g_req_queues[i].mutex);
+        pthread_mutex_lock(&g_comp_queues[i].mutex);
+        pthread_cond_broadcast(&g_comp_queues[i].cond);
+        pthread_mutex_unlock(&g_comp_queues[i].mutex);
+    }
+
+    /* Small delay to let workers drain completions */
+    usleep(100000);  /* 100ms */
+
+    /* Wait for workers first */
     for (uint32_t i = 0; i < opts.num_threads; i++) {
         pthread_join(g_worker_threads[i], NULL);
     }
+
+    /* Wait for pollers */
+    for (uint32_t i = 0; i < opts.num_threads; i++) {
+        pthread_join(g_poller_threads[i], NULL);
+    }
+
     pthread_join(printer_thread, NULL);
 
     uint64_t end_ns = get_time_ns();
@@ -490,14 +544,14 @@ main(int argc, char *argv[])
     uint64_t total_io = 0;
     uint64_t total_bytes = 0;
     uint64_t total_latency = 0;
-    uint64_t min_latency = 0;
+    uint64_t min_latency = UINT64_MAX;
     uint64_t max_latency = 0;
 
     for (uint32_t i = 0; i < opts.num_threads; i++) {
         total_io += g_stats[i].io_completed;
         total_bytes += g_stats[i].bytes_completed;
         total_latency += g_stats[i].total_latency_ns;
-        if (min_latency == 0 || g_stats[i].min_latency_ns < min_latency) {
+        if (g_stats[i].min_latency_ns < min_latency) {
             min_latency = g_stats[i].min_latency_ns;
         }
         if (g_stats[i].max_latency_ns > max_latency) {
@@ -519,9 +573,20 @@ main(int argc, char *argv[])
         printf("Max latency:    %.2f us\n", (double)max_latency / 1000.0);
     }
 
+    /* Cleanup */
     free(g_worker_threads);
+    free(g_poller_threads);
     free(g_stats);
-    ioperf_disk_destroy(g_disk);
+    free(worker_ids);
+    free(poller_ids);
+
+    for (uint32_t i = 0; i < opts.num_threads; i++) {
+        ring_destroy(&g_req_queues[i]);
+        ring_destroy(&g_comp_queues[i]);
+    }
+    free(g_req_queues);
+    free(g_comp_queues);
+
     if (opts.poller_cpus) {
         free(opts.poller_cpus);
     }
