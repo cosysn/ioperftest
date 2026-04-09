@@ -59,12 +59,22 @@ struct io_request {
     struct io_request *next;  /* for delay list */
 };
 
+/* Memory pool for io_request (lock-free stack) */
+struct mem_pool {
+    struct io_request *requests;  /* pre-allocated array */
+    _Atomic uintptr_t free_stack;  /* lock-free stack head (as uintptr_t) */
+    uint32_t size;
+};
+
 /* Lock-free ring buffer (SPSC) */
 struct ring {
     struct io_request **slots;
     uint32_t size;
     _Atomic uint32_t head;  /* producer writes here */
     _Atomic uint32_t tail;  /* consumer reads here */
+
+    /* Per-ring memory pool for this channel */
+    struct mem_pool pool;
 };
 
 /* Delay list per poller (sorted by submit time) */
@@ -80,17 +90,24 @@ static inline uint64_t get_time_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
+/* Forward declarations for pool functions */
+static void pool_init(struct mem_pool *pool, uint32_t size);
+static void pool_destroy(struct mem_pool *pool);
+
 /* Ring init */
 static void ring_init(struct ring *r, uint32_t size) {
     r->slots = calloc(size, sizeof(struct io_request *));
     r->size = size;
     atomic_init(&r->head, 0);
     atomic_init(&r->tail, 0);
+    /* Initialize per-ring memory pool */
+    pool_init(&r->pool, size);
 }
 
 /* Ring destroy */
 static void ring_destroy(struct ring *r) {
     free(r->slots);
+    pool_destroy(&r->pool);
 }
 
 /* Ring is empty */
@@ -131,13 +148,54 @@ static void delay_list_init(struct delay_list *dl) {
     dl->count = 0;
 }
 
-/* Delay list destroy */
-static void delay_list_destroy(struct delay_list *dl) {
-    struct io_request *r = dl->head;
-    while (r) {
-        struct io_request *next = r->next;
-        free(r);
-        r = next;
+/* Memory pool init - pre-allocate all io_requests */
+static void pool_init(struct mem_pool *pool, uint32_t size) {
+    pool->size = size;
+    pool->requests = calloc(size, sizeof(struct io_request));
+    atomic_store(&pool->free_stack, (uintptr_t)NULL);
+
+    /* Build free stack - each request points to next */
+    for (uint32_t i = 0; i < size; i++) {
+        pool->requests[i].next = (i + 1 < size) ? &pool->requests[i + 1] : NULL;
+    }
+    atomic_store(&pool->free_stack, (uintptr_t)&pool->requests[0]);
+}
+
+/* Memory pool destroy */
+static void pool_destroy(struct mem_pool *pool) {
+    free(pool->requests);
+}
+
+/* Pool alloc - pop from lock-free stack, O(1) */
+static struct io_request *pool_alloc(struct mem_pool *pool) {
+    uintptr_t head = atomic_load(&pool->free_stack);
+    while (head != (uintptr_t)NULL) {
+        struct io_request *req = (struct io_request *)head;
+        uintptr_t next = (uintptr_t)req->next;
+        if (atomic_compare_exchange_weak(&pool->free_stack, &head, next)) {
+            /* Re-init the request */
+            req->submit_ns = 0;
+            req->offset_blocks = 0;
+            req->num_blocks = 0;
+            req->io_size = 0;
+            req->stats = NULL;
+            req->next = NULL;
+            return req;
+        }
+        /* CAS failed, retry with new head */
+    }
+    return NULL;  /* pool exhausted */
+}
+
+/* Pool free - push back to lock-free stack, O(1) */
+static void pool_free(struct mem_pool *pool, struct io_request *req) {
+    uintptr_t head = atomic_load(&pool->free_stack);
+    while (1) {
+        req->next = (struct io_request *)head;
+        if (atomic_compare_exchange_weak(&pool->free_stack, &head, (uintptr_t)req)) {
+            return;
+        }
+        /* CAS failed, head is updated with current stack head, retry */
     }
 }
 
@@ -195,8 +253,11 @@ worker_thread(void *arg)
     uint64_t offset = 0;
 
     while (g_running) {
-        /* 分配请求 */
-        struct io_request *req = calloc(1, sizeof(*req));
+        /* 从内存池分配请求 */
+        struct io_request *req = pool_alloc(&ring->pool);
+        if (req == NULL) {
+            continue;  /* 池空，暂跳过 */
+        }
         req->submit_ns = get_time_ns();
         req->offset_blocks = offset;
         req->num_blocks = 1;
@@ -205,7 +266,7 @@ worker_thread(void *arg)
 
         /* 入队，如果满则丢弃（不应该发生） */
         if (!ring_enqueue(ring, req)) {
-            free(req);  /* 队列满，丢弃 */
+            pool_free(&ring->pool, req);  /* 队列满，丢弃 */
         }
 
         /* 推进 offset */
@@ -258,7 +319,7 @@ poller_thread(void *arg)
                 ready->stats->max_latency_ns = latency;
             }
 
-            free(ready);
+            pool_free(&ring->pool, ready);
         }
 
         /* 3. 纯轮询，不让出 CPU */
@@ -276,7 +337,7 @@ poller_thread(void *arg)
         while ((ready = delay_list_pop_ready(dl, now, 0)) != NULL) {
             ready->stats->io_completed++;
             ready->stats->bytes_completed += ready->io_size;
-            free(ready);
+            pool_free(&ring->pool, ready);
         }
 
         if (ring_empty(ring) && dl->count == 0) {
@@ -464,7 +525,6 @@ int main(int argc, char *argv[])
     free(poller_ids);
     for (uint32_t i = 0; i < opts.num_threads; i++) {
         ring_destroy(&g_rings[i]);
-        delay_list_destroy(&g_delay_lists[i]);
     }
     free(g_rings);
     free(g_delay_lists);
