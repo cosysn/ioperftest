@@ -243,8 +243,10 @@ static struct delay_list *g_delay_lists;
 static uint64_t g_read_delay_ns;
 static uint64_t g_write_delay_ns;
 static _Atomic uint64_t g_total_processed;
+static _Atomic uint32_t g_in_flight;  /* current in-flight IO count */
+static uint32_t g_target_depth;       /* target IO depth per worker */
 
-/* Worker thread - 纯异步，提交后立即返回 */
+/* Worker thread - 维持固定队列深度 */
 static void *
 worker_thread(void *arg)
 {
@@ -253,6 +255,11 @@ worker_thread(void *arg)
     uint64_t offset = 0;
 
     while (g_running) {
+        /* 等待直到 in_flight < target_depth */
+        while (atomic_load(&g_in_flight) >= g_target_depth) {
+            /* spin-wait */
+        }
+
         /* 从内存池分配请求 */
         struct io_request *req = pool_alloc(&ring->pool);
         if (req == NULL) {
@@ -264,9 +271,12 @@ worker_thread(void *arg)
         req->io_size = 512;
         req->stats = &g_stats[worker_id];
 
+        atomic_fetch_add(&g_in_flight, 1);
+
         /* 入队，如果满则丢弃（不应该发生） */
         if (!ring_enqueue(ring, req)) {
             pool_free(&ring->pool, req);  /* 队列满，丢弃 */
+            atomic_fetch_sub(&g_in_flight, 1);
         }
 
         /* 推进 offset */
@@ -309,6 +319,7 @@ poller_thread(void *arg)
 
             /* 统计 - 只在运行阶段，非 drain 阶段 */
             atomic_fetch_add(&g_total_processed, 1);
+            atomic_fetch_sub(&g_in_flight, 1);
             ready->stats->io_completed++;
             ready->stats->bytes_completed += ready->io_size;
             ready->stats->total_latency_ns += latency;
@@ -335,6 +346,7 @@ poller_thread(void *arg)
         uint64_t now = get_time_ns();
         struct io_request *ready;
         while ((ready = delay_list_pop_ready(dl, now, 0)) != NULL) {
+            atomic_fetch_sub(&g_in_flight, 1);
             ready->stats->io_completed++;
             ready->stats->bytes_completed += ready->io_size;
             pool_free(&ring->pool, ready);
@@ -396,6 +408,7 @@ static void print_usage(const char *prog) {
     printf("  -t <threads>    Threads (default: %d)\n", DEFAULT_NUM_THREADS);
     printf("  -T <sec>        Duration (default: %d)\n", DEFAULT_TEST_DURATION_SEC);
     printf("  -r <us>         Read latency (default: 100)\n");
+    printf("  -d <depth>      IO depth per worker (default: 128)\n");
     printf("  -c <cpus>       Poller CPUs (e.g. 0,2,4,6)\n");
     printf("  -h, --help      Help\n");
 }
@@ -409,6 +422,7 @@ int main(int argc, char *argv[])
         .write_latency_us = 200,
         .poller_cpus = NULL,
         .poller_cpus_count = 0,
+        .io_depth = 128,
     };
 
     for (int i = 1; i < argc; i++) {
@@ -416,6 +430,7 @@ int main(int argc, char *argv[])
         else if (strcmp(argv[i], "-T") == 0 && i + 1 < argc) opts.duration_sec = atoi(argv[++i]);
         else if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) opts.read_latency_us = atoi(argv[++i]);
         else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) opts.write_latency_us = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-d") == 0 && i + 1 < argc) opts.io_depth = atoi(argv[++i]);
         else if (strcmp(argv[i], "--read") == 0) opts.is_read_test = true;
         else if (strcmp(argv[i], "--write") == 0) opts.is_write_test = true;
         else if (strcmp(argv[i], "--rand") == 0) opts.is_rand_test = true;
@@ -438,7 +453,7 @@ int main(int argc, char *argv[])
     }
 
     printf("=== IOperf Async Benchmark ===\n");
-    printf("Threads: %u, Duration: %u sec\n", opts.num_threads, opts.duration_sec);
+    printf("Threads: %u, Duration: %u sec, IO depth: %u\n", opts.num_threads, opts.duration_sec, opts.io_depth);
     printf("Read latency: %u us, Write latency: %u us\n", opts.read_latency_us, opts.write_latency_us);
     if (opts.poller_cpus_count > 0) {
         printf("Poller CPUs: ");
@@ -451,6 +466,8 @@ int main(int argc, char *argv[])
     g_draining = false;
     g_read_delay_ns = opts.read_latency_us * 1000ULL;
     g_write_delay_ns = opts.write_latency_us * 1000ULL;
+    g_target_depth = opts.io_depth;
+    atomic_store(&g_in_flight, 0);
 
     g_stats = calloc(opts.num_threads, sizeof(struct thread_stats));
     for (uint32_t i = 0; i < opts.num_threads; i++) g_stats[i].min_latency_ns = UINT64_MAX;
